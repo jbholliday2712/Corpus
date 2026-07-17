@@ -253,10 +253,27 @@ click approve. Repeat for every manual we use at work.
 
 ## 10. Current state
 
-- [ ] Nothing built yet. Start at M1.
+- [x] M1 skeleton built: repo structure, `pipeline/` Python package,
+      `providers.py` (embed/vision/llm via NIM), `db.py` (Supabase),
+      `config.py` (.env loader), `cli.py` stub (check/ingest/watch/retry/status),
+      `db/schema.sql` migration, `pipeline/tests/test_chunk.py`.
+- [ ] **Not yet done — needs my real credentials, can't be done from this session:**
+  - Fill in `pipeline/.env` (copy from `pipeline/.env.example`) with real
+    NIM_API_KEY, NIM_EMBED_MODEL, SUPABASE_URL, SUPABASE_SERVICE_KEY, DATABASE_URL.
+  - Apply `db/schema.sql` to the Supabase project.
+  - Run `corpus check` (from `pipeline/`, after `pip install -e ".[dev]"`) to
+    confirm Supabase connectivity and to print the real embedding dimension.
+  - If the printed dims != 1024, edit `vector(1024)` in `db/schema.sql`
+    before/after applying, then re-apply.
+  - Once confirmed, record the model id via `db.set_setting("embedding_model", "<id>")`
+    or manually in the `settings` table — this is what the future chat app reads.
+- [ ] M2 not started: extract.py/chunk.py/embed.py are stubs that raise
+      NotImplementedError. intake.py (hash + copy to store/ + insert row) is
+      implemented and ready to use once Supabase is reachable.
 
 ## 11. Session log
 
 | Date | Session summary | Next step |
 |---|---|---|
 | — | Project planned, STATUS.md created | Begin M1 |
+| 2026-07-17 | M1 skeleton built on `main`: repo layout, `pipeline/` package (config, providers, db, cli stub, intake), `db/schema.sql`, chunk test scaffold. All committed directly to main per new workflow (no per-session branches). Verified `corpus check` degrades gracefully with no `.env`, `pytest` passes. | Fill in real `.env` values, apply schema to Supabase, run `corpus check` to confirm embedding dims, then start M2 (text-path happy path with one clean manual). |

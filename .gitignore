@@ -1,0 +1,31 @@
+# Environment
+.env
+pipeline/.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Node / Next.js
+node_modules/
+review-ui/.next/
+review-ui/out/
+
+# Local ingestion data (gitignored per STATUS.md)
+inbox/*
+!inbox/.gitkeep
+store/*
+!store/.gitkeep
+work/*
+!work/.gitkeep
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
