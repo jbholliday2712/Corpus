@@ -19,7 +19,7 @@ def main():
 def check():
     """Verify .env is populated, Supabase is reachable, and the embedding
     endpoint responds (prints the vector dimension so it can be checked
-    against db/schema.sql)."""
+    against supabase/migrations/)."""
     settings = load_settings()
     missing = settings.missing()
     if missing:
@@ -44,8 +44,8 @@ def check():
             click.echo(f"NIM embed: OK, model={settings.nim_embed_model}, dims={dims}")
             if dims != 1024:
                 click.echo(
-                    f"WARNING: db/schema.sql declares vector(1024) but this "
-                    f"model returns {dims} dims. Edit the schema before applying it."
+                    f"WARNING: supabase/migrations declares vector(1024) but this "
+                    f"model returns {dims} dims. Add a migration to alter the column before relying on it."
                 )
         except Exception as exc:  # noqa: BLE001
             click.echo(f"NIM embed: FAILED ({exc})")

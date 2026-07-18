@@ -1,10 +1,10 @@
 -- Corpus ingestion pipeline schema.
--- Apply to the Supabase project via the SQL editor or `psql "$DATABASE_URL" -f db/schema.sql`.
+-- Applied automatically by the Supabase GitHub integration on push to main.
 --
 -- IMPORTANT: the `embedding` column dimension below (1024) matches
 -- nvidia/nv-embedqa-e5-v5. If a different NIM embedding model is used,
 -- confirm its output dimension (run `corpus check` after configuring .env)
--- and edit the `vector(N)` size before applying.
+-- and edit the `vector(N)` size in a follow-up migration.
 
 create extension if not exists vector;
 create extension if not exists pgcrypto; -- gen_random_uuid()

@@ -176,6 +176,9 @@ form here.
 ```
 corpus/
 ├── STATUS.md              ← this file
+├── supabase/
+│   ├── config.toml        ← links this repo to the Supabase project (GitHub integration)
+│   └── migrations/        ← schema migrations, auto-applied on push to main
 ├── pipeline/              ← Python
 │   ├── pyproject.toml
 │   ├── corpus/
@@ -256,15 +259,19 @@ click approve. Repeat for every manual we use at work.
 - [x] M1 skeleton built: repo structure, `pipeline/` Python package,
       `providers.py` (embed/vision/llm via NIM), `db.py` (Supabase),
       `config.py` (.env loader), `cli.py` stub (check/ingest/watch/retry/status),
-      `db/schema.sql` migration, `pipeline/tests/test_chunk.py`.
+      `pipeline/tests/test_chunk.py`.
+- [x] Supabase GitHub integration wired: `supabase/config.toml` +
+      `supabase/migrations/20260718000000_initial_schema.sql` (schema moved
+      out of `db/schema.sql`, which no longer exists). Migrations
+      auto-apply to the linked Supabase project on push to `main` — no more
+      manual SQL editor step.
 - [ ] **Not yet done — needs my real credentials, can't be done from this session:**
-  - Fill in `pipeline/.env` (copy from `pipeline/.env.example`) with real
-    NIM_API_KEY, NIM_EMBED_MODEL, SUPABASE_URL, SUPABASE_SERVICE_KEY, DATABASE_URL.
-  - Apply `db/schema.sql` to the Supabase project.
+  - Fill in `pipeline/.env` with real NIM_API_KEY, NIM_EMBED_MODEL,
+    SUPABASE_URL, SUPABASE_SERVICE_KEY, DATABASE_URL.
   - Run `corpus check` (from `pipeline/`, after `pip install -e ".[dev]"`) to
     confirm Supabase connectivity and to print the real embedding dimension.
-  - If the printed dims != 1024, edit `vector(1024)` in `db/schema.sql`
-    before/after applying, then re-apply.
+  - If the printed dims != 1024, add a follow-up migration altering
+    `vector(1024)` in `chunks.embedding`, push it, and re-check.
   - Once confirmed, record the model id via `db.set_setting("embedding_model", "<id>")`
     or manually in the `settings` table — this is what the future chat app reads.
 - [ ] M2 not started: extract.py/chunk.py/embed.py are stubs that raise
