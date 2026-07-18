@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 
 from corpus import chunk, clean, db, embed, extract, intake, metadata
+from corpus import reprocess as reprocess_pipeline
 from corpus.config import load_settings
 from corpus.paths import INBOX_DIR
 from corpus.providers import NIMClient
@@ -249,6 +250,56 @@ def restore_furniture(document_id: str, normalized_line: str):
     except Exception as exc:  # noqa: BLE001
         db.update_document(document_id, {"status": "failed", "error_message": str(exc)})
         raise click.ClickException(f"Restore failed: {exc}")
+
+
+@main.command(name="reprocess")
+@click.argument("document_id")
+@click.option(
+    "--from-stage",
+    "from_stage",
+    type=click.Choice(reprocess_pipeline.FROM_STAGES),
+    default="clean",
+    help="Stage to restart from: clean (re-clean + re-chunk + re-embed), "
+    "chunk (re-chunk + re-embed), or embed (re-embed only).",
+)
+def reprocess_cmd(document_id: str, from_stage: str):
+    """Re-run a document's pipeline from a chosen stage onward. Thin
+    wrapper around corpus.reprocess.reprocess_document — see that module
+    for the exact idempotency guarantees per stage."""
+    doc_row = db.get_document(document_id)
+    if doc_row is None:
+        raise click.ClickException(f"no document {document_id}")
+    try:
+        report = reprocess_pipeline.reprocess_document(document_id, from_stage)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"Reprocess failed: {exc}")
+    if report.get("safety_rail_triggered"):
+        click.echo(
+            f"Reprocessed {document_id} from '{from_stage}' -> stopped for review "
+            "(cleaning safety rail triggered)"
+        )
+    else:
+        click.echo(f"Reprocessed {document_id} from '{from_stage}' -> status=review")
+
+
+@main.command(name="reset")
+@click.argument("document_id")
+@click.option(
+    "--hard",
+    "hard",
+    is_flag=True,
+    required=True,
+    help="Required confirmation flag: deletes the document row (cascades to "
+    "chunks), work/<hash>/, and store/<hash>.pdf.",
+)
+def reset_cmd(document_id: str, hard: bool):
+    """Hard reset a document: delete its DB row, extracted pages, and
+    stored PDF. The PDF must be re-dropped into inbox/ to reprocess it."""
+    try:
+        reprocess_pipeline.reset_hard(document_id)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"Reset failed: {exc}")
+    click.echo(f"Reset {document_id}: document row, chunks, work/, and store/ PDF deleted")
 
 
 @main.command(name="status")

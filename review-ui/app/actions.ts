@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { getSupabaseAdmin } from "@/lib/supabase";
+import { requirePipelineEnv, workDirFor } from "@/lib/pipeline";
 
 const execFileAsync = promisify(execFile);
 
@@ -17,24 +18,6 @@ function formString(formData: FormData, key: string): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
-}
-
-function requirePipelineEnv(): { pythonBin: string; pipelineDir: string } {
-  const pythonBin = process.env.CORPUS_PYTHON;
-  const pipelineDir = process.env.CORPUS_PIPELINE_DIR;
-  if (!pythonBin || !pipelineDir) {
-    throw new Error(
-      "CORPUS_PYTHON / CORPUS_PIPELINE_DIR are not set (see review-ui/.env.local.example)."
-    );
-  }
-  return { pythonBin, pipelineDir: path.resolve(pipelineDir) };
-}
-
-// work/ is a sibling of pipeline/ per corpus/paths.py (ROOT/work,
-// ROOT/pipeline) — no separate env var needed, just derive it.
-function workDirFor(fileHash: string): string {
-  const { pipelineDir } = requirePipelineEnv();
-  return path.join(pipelineDir, "..", "work", fileHash);
 }
 
 export async function confirmMetadata(formData: FormData): Promise<void> {

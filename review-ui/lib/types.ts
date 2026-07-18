@@ -7,6 +7,13 @@ export type DocStatus =
   | "done"
   | "failed";
 
+// Statuses where a pipeline stage is actively running against this
+// document right now — narrower than StatusBadge's ACTIVE_STATUSES (which
+// also includes "queued", a document that hasn't started yet and is safe
+// to reprocess/reset). Used to disable reprocess/reset controls and to
+// reject those requests server-side while a background run owns the row.
+export const IN_PROGRESS_STATUSES: DocStatus[] = ["extracting", "chunking", "embedding"];
+
 export const DOC_TYPES = [
   "engineering_manual",
   "install_manual",

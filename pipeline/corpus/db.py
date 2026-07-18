@@ -69,6 +69,26 @@ def delete_chunks(document_id: str) -> None:
     client.table("chunks").delete().eq("document_id", document_id).execute()
 
 
+def delete_document(document_id: str) -> None:
+    """Used by `corpus reset --hard`. ON DELETE CASCADE on
+    chunks.document_id (see supabase/migrations) takes care of the chunk
+    rows — the caller is still responsible for the filesystem (work/<hash>/,
+    store/<hash>.pdf), which this function knows nothing about."""
+    client = get_client()
+    client.table("documents").delete().eq("id", document_id).execute()
+
+
+def clear_chunk_embeddings(document_id: str) -> None:
+    """Used by `corpus reprocess --from-stage embed`: embed_document only
+    fills in chunks with a null embedding, so a genuine re-embed (e.g. after
+    switching NIM_EMBED_MODEL) has to null every existing embedding first or
+    embed_document would see nothing to do."""
+    client = get_client()
+    client.table("chunks").update({"embedding": None}).eq(
+        "document_id", document_id
+    ).execute()
+
+
 def count_chunks(document_id: str) -> int:
     client = get_client()
     res = (

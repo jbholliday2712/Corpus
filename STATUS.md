@@ -219,7 +219,12 @@ or over-aggressive clean never loses the original extraction.
 Pages:
 1. **Queue view** — table of documents: name, inferred metadata, status,
    chunk count, error message if failed. Buttons: confirm metadata (with
-   inline edit), retry, delete (cascades chunks).
+   inline edit), retry, delete (cascades chunks), reprocess (split button:
+   default from cleaning, dropdown for from-chunking/from-embedding — warns
+   if the document has manual chunk retrieval-include toggles that a
+   clean/chunk reprocess would lose), hard reset (overflow menu, red,
+   detailed confirm dialog). Polls a lightweight `/api/documents` endpoint
+   every 3s for live status/error updates without a full page re-render.
 2. **Document view** — chunks in order, rendered as markdown, showing page
    range, section, extraction path, token count per chunk. This is the
    inspection hatch: I check tables survived and sections make sense.
@@ -252,7 +257,8 @@ corpus/
 │   ├── pyproject.toml
 │   ├── corpus/
 │   │   ├── cli.py         ← entrypoints: ingest, watch, retry,
-│   │   │                     restore-furniture, embed-query, status
+│   │   │                     restore-furniture, reprocess, reset,
+│   │   │                     embed-query, status
 │   │   ├── intake.py
 │   │   ├── extract.py     ← triage + PyMuPDF + vision path
 │   │   ├── metadata.py
@@ -260,13 +266,18 @@ corpus/
 │   │   │                     safety rail (Stage 2.5)
 │   │   ├── chunk.py       ← packing + runt handling
 │   │   ├── embed.py
+│   │   ├── reprocess.py   ← reprocess_document/reset_hard — importable
+│   │   │                     logic behind `corpus reprocess`/`reset`, also
+│   │   │                     called directly by review-ui's API routes
 │   │   ├── providers.py   ← ALL NIM calls live here (embed/vision/llm)
 │   │   ├── db.py          ← Supabase/Postgres access
 │   │   └── config.py      ← reads .env
 │   └── tests/
 │       ├── test_chunk.py
-│       └── test_clean.py  ← the furniture detector is the other thing
-│                             worth unit-testing
+│       ├── test_clean.py  ← the furniture detector is the other thing
+│       │                     worth unit-testing
+│       └── test_reprocess.py ← monkeypatched db/clean/chunk/embed, asserts
+│                                 call order + idempotency per from-stage
 ├── review-ui/             ← Next.js app (App Router)
 ├── inbox/                 ← drop PDFs here (gitignored)
 ├── store/                 ← content-addressed PDF copies (gitignored)
@@ -1076,6 +1087,131 @@ click approve. Repeat for every manual we use at work.
      needed for that one).
   7. Once confirmed, this feature is done — keep loading the real corpus
      (M6).
+- [x] **Reprocess controls added to the review UI** (queue view: reprocess
+      a single document from a chosen stage, or hard-reset it entirely).
+      Built on `main` (sandbox again has no real Supabase/NIM — verified
+      with pytest + monkeypatched-DB tests, `tsc`/`next build`, and a local
+      `next dev` smoke test hitting the new routes; not run against real
+      data/browser):
+  - **Prerequisite refactor**: `corpus reprocess`/`corpus reset` did not
+    exist anywhere before this session (confirmed by reading `cli.py` in
+    full first). Added `pipeline/corpus/reprocess.py` with two importable
+    functions — `reprocess_document(document_id, from_stage)` and
+    `reset_hard(document_id)` — and made `cli.py`'s new `reprocess`/`reset`
+    commands thin wrappers around them, matching every other stage's
+    module/CLI split (extract.py, clean.py, chunk.py, embed.py).
+  - `reprocess_document` reuses the same "delete what the stage's own
+    resumability guard checks, then call the normal stage function" pattern
+    `restore-furniture` already established: `from_stage='clean'` force-
+    recleans (subject to the same safety rail — stops before chunk/embed if
+    triggered, same as a normal run), `'chunk'` keeps the existing cleaned
+    pages and just deletes+rebuilds chunks, `'embed'` keeps the existing
+    chunk rows and only clears their embeddings (new `db.clear_chunk_embeddings`)
+    so `embed_document`'s null-only resumability doesn't see "nothing to
+    do." Because every stage's write is one bulk insert/update, there's no
+    partially-torn-down state possible after a crash mid-reprocess — running
+    it again from the same stage always starts clean, satisfying the task's
+    idempotency requirement without any special recovery path. Sets
+    `status='queued'` up front so the queue view shows activity immediately,
+    even during the part of `'clean'` before `chunk_document`/`embed_document`
+    set their own in-progress statuses.
+  - `reset_hard` looks up `file_hash` first, deletes the `documents` row
+    (new `db.delete_document`, cascades to chunks per the existing FK), then
+    removes `work/<hash>/` and `store/<hash>.pdf` from disk.
+  - `pipeline/tests/test_reprocess.py`: 11 tests against a hand-rolled
+    `FakeDB` that records call order (not just call presence) — this
+    matters because e.g. `delete_chunks` must run strictly between `clean`
+    and `chunk`, or `chunk_document`'s own "skip if chunks already exist"
+    guard would defeat the reprocess entirely. Covers all three from-stages,
+    the safety-rail-stops-early path, unknown-stage/missing-document errors,
+    the failed→status='failed'+error_message path, the queued-up-front
+    status write, and `reset_hard` (including tolerating an
+    already-missing work dir/PDF, and rejecting an unknown document). 76/76
+    passing pipeline-wide. Also smoke-tested the two new CLI commands
+    directly with `click.testing.CliRunner` (mocked `db`/`reprocess`
+    module) to catch wiring bugs (option names, required `--hard` flag)
+    `pytest` alone wouldn't have caught.
+  - review-ui: three new Route Handlers (not server actions, per explicit
+    spec) — `POST /api/documents/[id]/reprocess` (body `{fromStage}`,
+    validates against the three allowed stages, 404s if the document
+    doesn't exist, 409s if it's currently extracting/chunking/embedding,
+    otherwise spawns `python -m corpus.cli reprocess <id> --from-stage
+    <stage>` detached and returns 202 immediately — same fire-and-forget
+    pattern as `app/actions.ts`'s retry/upload/restore-furniture), `POST
+    /api/documents/[id]/reset` (same guards, spawns `corpus reset <id>
+    --hard`), and `GET /api/documents` (lightweight `id`/`status`/
+    `error_message` list for polling). Extracted the pipeline-env helper
+    `app/actions.ts` already had into `lib/pipeline.ts` so the two new
+    route files and `actions.ts` share one copy instead of duplicating it a
+    third time.
+  - New `ReprocessControls` client component per document row: a split
+    button (default click = reprocess from cleaning; the caret opens a
+    dropdown with all three stages, showing an inline warning under the
+    clean/chunk options — not under embed, since only those two actually
+    delete+recreate chunk rows — if the document has any chunk with
+    `metadata.retrieval_override` set) plus a small overflow menu with a
+    red "Hard reset" item behind a `confirm()` dialog that spells out
+    exactly what gets deleted (row, chunks, extracted pages, stored PDF)
+    and that the PDF needs re-dropping into `inbox/`. Both are disabled
+    while `status` is `extracting`/`chunking`/`embedding` (a new
+    `IN_PROGRESS_STATUSES` export, deliberately narrower than
+    `StatusBadge`'s `ACTIVE_STATUSES` — `queued` is safe to reprocess/reset,
+    it hasn't started yet).
+  - `DocumentTable` now polls `GET /api/documents` every 3s and merges the
+    live `status`/`error_message` into each row (falling back to the
+    server-rendered value until the first poll resolves) — deliberately
+    *not* the existing `AutoRefresh`/`router.refresh()` mechanism, which
+    re-renders the whole server component (including in-progress metadata
+    edit inputs) every tick; this only touches the status badge (which
+    already renders the pulsing "in progress" dot via `StatusBadge`, so no
+    new spinner component was needed) and error text. Removed `<AutoRefresh
+    />` from the queue page specifically, since the new polling supersedes
+    it there; left it on the document detail page untouched, where it still
+    serves a page this lightweight endpoint doesn't cover.
+  - `app/page.tsx` now also computes a `manualChunkToggles: Map<string,
+    boolean>` from the chunk metadata it already fetches (no new query) and
+    passes it down for the dropdown warning.
+  - `tsc --noEmit` clean, `next build` succeeds (all six routes now: `/`,
+    `/api/documents`, `/api/documents/[id]/reprocess`,
+    `/api/documents/[id]/reset`, `/documents/[id]`, `/graph`). Ran `next
+    dev` locally and hit the new routes directly: bad `fromStage` correctly
+    400s before ever touching Supabase; with no `.env.local` in this
+    sandbox, all three correctly 500 with the same clean
+    "SUPABASE_URL/SUPABASE_SERVICE_KEY are not set" error every other
+    Supabase-touching route already gives (not a crash) — expected here,
+    needs a real credentialed run to verify the actual reprocess/reset
+    behavior end-to-end.
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`. `cd pipeline && pip install -e ".[dev]"`, `pytest` →
+     expect 76 passed. `cd review-ui && npm install` (no new deps), `npm
+     run dev`.
+  2. Reprocess the CTec manual (or any already-processed document) from the
+     UI: click "Reprocess" (default, from cleaning) and watch the queue
+     view's status column move through the stages live via the new 3s
+     poll — confirm it actually shows queued → (cleaning happens, no
+     dedicated status) → chunking → embedding → review without a manual
+     page reload.
+  3. Try the dropdown: reprocess from chunking, then from embedding, on a
+     document with no manual chunk toggles — confirm no warning shown, and
+     that "from embedding" leaves the chunk count unchanged (same rows,
+     just re-embedded) while "from chunking"/"from cleaning" produce a
+     fresh chunk count.
+  4. Set a chunk's "Include in retrieval" toggle on a document, then open
+     its reprocess dropdown — confirm the warning appears under "from
+     cleaning"/"from chunking" but not "from embedding," then actually
+     reprocess from cleaning and confirm the toggle is indeed gone
+     afterward (expected loss, per the guard-rail warning) while a
+     furniture-restore choice on the same document survives (it lives in
+     `furniture_overrides.json`, not on the chunk row).
+  5. Try Hard reset on a disposable test document: confirm the dialog text
+     is accurate, confirm the row disappears from the queue (after
+     `router.refresh()`/the next poll), and confirm `work/<hash>/` and
+     `store/<hash>.pdf` are actually gone on disk.
+  6. Confirm both buttons are genuinely disabled (not just visually greyed)
+     while a document is extracting/chunking/embedding — e.g. click
+     reprocess on one document, then immediately try clicking reprocess
+     again on the same row before it reaches `review`.
+  7. Once confirmed, this feature is done.
 
 ## 11. Session log
 
@@ -1097,4 +1233,5 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Tried the M5 review UI and gave feedback: no way to add a document from the UI, no visual way to see how documents/chunks relate, and the UI generally isn't user-friendly (asked specifically: no progress feedback, bare-bones design, hard to navigate). Confirmed chunk-level (not document-level) similarity graph is what's wanted, to be built now rather than deferred past M6. Built on `main` (sandbox still has no real Supabase): upload form + `uploadDocument` server action + `corpus ingest --json`; `/graph` page using `react-force-graph-2d` + a new `chunk_similarity_edges` Postgres function (HNSW-indexed per-chunk nearest-neighbours, not a full pairwise scan) exposed via Supabase RPC; persistent nav header, card-based layout, `AutoRefresh` polling component, and a pulsing status-dot for in-progress documents. `tsc`/`next build` clean across all three routes; `npm audit` shows no new vulnerabilities from the new dependency. Upload flow and graph rendering not verified against real data/browser (no credentials here). | Pull, `npm install`, apply the new `chunk_similarity_edges` migration, `npm run dev`, and actually use it: upload a real PDF, confirm it starts processing; open `/graph` once chunks are embedded and check nodes render/color/link correctly and clicking one highlights the right chunk; sanity-check the auto-refresh and new layout feel like a real improvement. Then this follow-up round (and M5 overall) is done — on to M6. |
 | 2026-07-18 | Asked whether the graph edges are "real links or making it up." Answer given: real cosine similarity over real embeddings (same pgvector operator/HNSW index the future chat app will use for retrieval at query time), not fabricated — but honestly limited to "these texts read as linguistically similar," which usually but not always tracks genuine topical relevance (boilerplate/table-structure text can false-positive; genuinely related content phrased differently can false-negative), and the 0.78/top-5 defaults are unvalidated guesses since there's barely any real corpus loaded yet. Then asked for improvements to actually understand the corpus before adding real files; picked click-to-preview, search-and-highlight, and topic clustering (declined a live threshold-filter slider). Built on `main` (still no real Supabase): `GraphPreviewPanel` (click a node, see full content + scored neighbours in a side panel, content fetched on demand via a new `getChunkContent` action so the graph page itself stays lightweight — dropped `content` from its chunk query entirely); search box wired to a new `corpus embed-query --json` CLI command (reuses `providers.py`, doesn't duplicate the NIM call in TS) + a new `search_chunks` Postgres function, highlighting matching nodes and fading the rest; a "Color: cluster" toggle using client-side union-find over the displayed edges (`lib/clustering.ts`) as an honest, documented-as-approximate stand-in for real topic modeling; a "Chunks"/"Documents" view toggle for a document-level zoom-out, aggregated client-side from the same edge data. Verified the two new pure-logic pieces (union-find, document-edge aggregation) standalone with hand-built test graphs before wiring into React, since this sandbox can't render canvas. `tsc`/`next build` clean across all four routes, no new `npm audit` findings. Interaction behavior (actual clicks/search/clustering against real embeddings) not verified — needs a real browser and real data. | Pull, install, apply both new migrations, `npm run dev`. Confirm the preview panel loads real content, run a real search query and sanity-check the matches, and — the actually interesting test — toggle cluster coloring once more than one document is loaded and judge honestly whether same-colored chunks across manuals read as related to a human, which is the real answer to "is this actually smart." Then start loading the rest of the real corpus (M6). |
 | 2026-07-18 | M6 started (real files going in), and search turned out to actually be broken: `Error: No such option '--json'` when running a real query. Root cause — `searchChunks` in `app/actions.ts` called `corpus embed-query <text> --json`, but `embed-query` (unlike `ingest`) never had a `--json` flag, it just always prints JSON; the flag was invalid and click rejected it. This shipped broken because the CLI-side test for `embed-query` only exercised the Python side directly, never the exact argv review-ui sends — a gap in how the CLI-from-Node integration points get tested. Reproduced the exact error with `CliRunner` first, then fixed by dropping the bad arg, then re-verified. Also asked how to verify documents without reading every one — built `lib/flags.ts`: cheap DB-only heuristics (zero chunks despite pages, low tokens/page, near-empty chunks, heavily-vision documents, the *specific* M4 prose-in-metadata pattern, missing doc_type), surfaced as a Flags column + "Flagged only" filter on the queue view and inline chunk highlighting on the document page. Verified the flag logic against 5 hand-built scenarios (including reproducing the real M4 prose bug to confirm it gets caught) before wiring in. `tsc`/`next build` clean, no new deps. | Pull, retry the search that failed (no reinstall needed), apply `search_chunks` if not already applied. Use the Flags column as the actual workflow going forward: open only what's flagged, spot-check a few unflagged documents occasionally to calibrate trust in the heuristics. Keep loading the real corpus. |
+| 2026-07-18 | Added reprocess/hard-reset controls to the review UI, on `main` (sandbox still has no real Supabase/NIM). Neither `corpus reprocess` nor `corpus reset` existed before this session; built `pipeline/corpus/reprocess.py` (`reprocess_document`/`reset_hard`, importable, reusing the "delete what the target stage's resumability guard checks, then call the normal stage function" pattern `restore-furniture` already established) with `cli.py`'s new `reprocess`/`reset` commands as thin wrappers, plus two new `db.py` functions (`delete_document`, `clear_chunk_embeddings`). 11 new tests against a call-order-recording `FakeDB` (76/76 pipeline-wide), plus a `CliRunner` smoke test of the new CLI wiring. review-ui: three new Route Handlers (`GET /api/documents` for 3s polling, `POST .../reprocess`, `POST .../reset`, all guarded against acting on an in-progress document) instead of server actions, per explicit spec; a new `ReprocessControls` split-button+overflow-menu component (warns about losing manual chunk retrieval toggles only for the two stages that actually delete+recreate chunk rows; hard-reset behind a detailed `confirm()`); `DocumentTable` now polls and merges live status/error without a full server re-render, replacing `AutoRefresh` on the queue page specifically (left untouched on the document detail page). `tsc`/`next build` clean across all six routes; `next dev` smoke-tested locally — bad input 400s before touching Supabase, missing-credentials 500s are the same clean error every other route already gives here. Not run against real data/browser. | Pull, install both sides, `pytest` (76 passed expected), `npm run dev`. Reprocess the CTec manual from the UI and watch status move through the stages live in the queue view (the task's own acceptance test); try each dropdown stage, confirm the manual-chunk-toggle warning appears/behaves correctly, hard-reset a disposable document and confirm the filesystem state is actually gone, and confirm both controls are genuinely disabled mid-run. |
 | 2026-07-19 | Added the cleaning stage per a fully-specified task (furniture stripping, structural page/chunk tagging, runt handling, >15% safety rail, Cleaning tab, furniture-detector unit tests) — one genuine gap in the spec: the repeated-safety-warning test case referenced "(see note below)" with no note attached. Asked and got a clear answer: add a keyword exception (`warning`/`caution`/`danger`/`note:`), never auto-strip that content regardless of repetition, given this is a fire/security panel corpus. Built `clean.py` (new), updated `chunk.py` (reads cleaned pages, runt handling, structural metadata), `cli.py` (`_process` gains a clean step + early-stop on the safety rail, new `restore-furniture` command), `db.py` (`delete_chunks`), a new migration (`documents.metadata` column, graph/search RPCs updated to respect the new exclusion rule), and the review UI's new Cleaning tab. Found and fixed two real logic bugs before they shipped (not caught by the spec, caught by testing): `apply_runt_handling` initially couldn't cascade-merge multiple consecutive runts (excluded already-runt-tagged chunks as merge targets, not just structural ones); `clean_pages` initially flattened cleaned lines with a single join, silently destroying the paragraph boundaries `chunk.py`'s splitting depends on. Also worked through several of my own test-fixture bugs (templated "page N" body text registering as furniture itself) before the real test suite was trustworthy. 65/65 pipeline tests passing (14 new for `clean.py`, 10 new for runt handling), 3 hand-built end-to-end scenarios verified via monkeypatched DB (safety rail correctly passes on realistic content, correctly trips and blocks chunk/embed on sparse content, `proceed_override` correctly unsticks it), `tsc`/`next build` clean across all four routes. Nothing verified against real Supabase/NIM/manuals — same sandbox constraint as every session. | Pull, reinstall (no new deps either side), apply the new migration, `pytest` (expect 65 passed). Run a real manual through and actually judge the heuristic against real content: does furniture.json look right, does a real TOC page get tagged, does a repeated real safety warning survive, is 15% the right safety-rail threshold. Try restoring a furniture line and toggling a structural/runt chunk's retrieval inclusion for real. Then back to loading the rest of the corpus (M6). |

@@ -1,9 +1,7 @@
 import { getSupabaseAdmin } from "@/lib/supabase";
 import type { DocumentRow } from "@/lib/types";
 import { uploadDocument } from "./actions";
-import { ACTIVE_STATUSES } from "@/components/StatusBadge";
 import { UploadForm } from "@/components/UploadForm";
-import { AutoRefresh } from "@/components/AutoRefresh";
 import { DocumentTable } from "@/components/DocumentTable";
 import { computeDocumentFlags, type ChunkStat, type DocumentFlag } from "@/lib/flags";
 
@@ -31,7 +29,6 @@ export default async function QueuePage({
   }
 
   const docs = (documents ?? []) as DocumentRow[];
-  const hasActiveDocument = docs.some((d) => ACTIVE_STATUSES.includes(d.status));
 
   // Lightweight per-chunk stats (no content) — enough to compute chunk
   // counts and the flagging heuristics in lib/flags.ts without shipping any
@@ -42,6 +39,7 @@ export default async function QueuePage({
 
   const chunkCounts = new Map<string, number>();
   const chunksByDoc = new Map<string, ChunkStat[]>();
+  const manualChunkToggles = new Map<string, boolean>();
   for (const row of (chunkRows ?? []) as {
     document_id: string;
     token_count: number | null;
@@ -57,6 +55,14 @@ export default async function QueuePage({
     const list = chunksByDoc.get(row.document_id);
     if (list) list.push(stat);
     else chunksByDoc.set(row.document_id, [stat]);
+
+    // A human explicitly re-included this chunk via the Cleaning/Chunks tab
+    // (see setChunkRetrievalOverride in app/actions.ts) — reprocessing from
+    // 'clean' or 'chunk' deletes and recreates chunk rows, which loses this,
+    // so ReprocessControls needs to know to warn about it per document.
+    if (row.metadata?.retrieval_override) {
+      manualChunkToggles.set(row.document_id, true);
+    }
   }
 
   const flagsByDoc = new Map<string, DocumentFlag[]>();
@@ -81,8 +87,6 @@ export default async function QueuePage({
 
   return (
     <main className="mx-auto max-w-6xl px-8 py-8">
-      {hasActiveDocument && <AutoRefresh />}
-
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold text-gray-900">Document Queue</h1>
         <span className="text-sm text-gray-500">
@@ -107,7 +111,12 @@ export default async function QueuePage({
           <code>inbox/</code> and run <code>corpus watch</code>.
         </p>
       ) : (
-        <DocumentTable docs={docs} chunkCounts={chunkCounts} flagsByDoc={flagsByDoc} />
+        <DocumentTable
+          docs={docs}
+          chunkCounts={chunkCounts}
+          flagsByDoc={flagsByDoc}
+          manualChunkToggles={manualChunkToggles}
+        />
       )}
     </main>
   );

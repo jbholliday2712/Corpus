@@ -1,13 +1,60 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
-import type { DocumentRow } from "@/lib/types";
+import { useEffect, useMemo, useState } from "react";
+import type { DocStatus, DocumentRow } from "@/lib/types";
 import type { DocumentFlag } from "@/lib/flags";
 import { deleteDocument, retryDocument } from "@/app/actions";
 import { StatusBadge } from "@/components/StatusBadge";
 import { MetadataForm } from "@/components/MetadataForm";
 import { ConfirmSubmitButton } from "@/components/ConfirmSubmitButton";
+import { ReprocessControls } from "@/components/ReprocessControls";
+
+const POLL_INTERVAL_MS = 3000;
+
+interface LiveStatus {
+  status: DocStatus;
+  error_message: string | null;
+}
+
+/**
+ * Polls the lightweight /api/documents endpoint so status changes (e.g. a
+ * reprocess run moving a document through chunking -> embedding -> review)
+ * show up without a full page reload. Deliberately separate from
+ * AutoRefresh's router.refresh(): that re-renders the whole server
+ * component (metadata forms, flags, chunk counts) every tick, which would
+ * blow away in-progress form input; this only ever touches the status
+ * badge and error text for rows already on the page.
+ */
+function useLiveStatuses(): Map<string, LiveStatus> {
+  const [live, setLive] = useState<Map<string, LiveStatus>>(new Map());
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const res = await fetch("/api/documents");
+        if (!res.ok || cancelled) return;
+        const body = (await res.json()) as { documents: (LiveStatus & { id: string })[] };
+        if (cancelled) return;
+        setLive(new Map(body.documents.map((d) => [d.id, d])));
+      } catch {
+        // Transient fetch failure — keep showing the last known status
+        // rather than clearing it; the next tick will retry.
+      }
+    }
+
+    poll();
+    const id = setInterval(poll, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  return live;
+}
 
 function FlagBadge({ flags }: { flags: DocumentFlag[] }) {
   if (flags.length === 0) {
@@ -31,12 +78,15 @@ export function DocumentTable({
   docs,
   chunkCounts,
   flagsByDoc,
+  manualChunkToggles,
 }: {
   docs: DocumentRow[];
   chunkCounts: Map<string, number>;
   flagsByDoc: Map<string, DocumentFlag[]>;
+  manualChunkToggles: Map<string, boolean>;
 }) {
   const [flaggedOnly, setFlaggedOnly] = useState(false);
+  const liveStatuses = useLiveStatuses();
 
   const flaggedCount = useMemo(
     () => docs.filter((d) => (flagsByDoc.get(d.id)?.length ?? 0) > 0).length,
@@ -79,61 +129,72 @@ export function DocumentTable({
             </tr>
           </thead>
           <tbody>
-            {visibleDocs.map((doc) => (
-              <tr
-                key={doc.id}
-                className="border-b border-gray-100 align-top last:border-b-0 hover:bg-gray-50"
-              >
-                <td className="px-4 py-3">
-                  <Link
-                    href={`/documents/${doc.id}`}
-                    className="font-medium text-blue-700 hover:underline"
-                  >
-                    {doc.file_name}
-                  </Link>
-                  <div className="text-xs text-gray-500">{doc.page_count ?? "?"} pages</div>
-                </td>
-                <td className="px-4 py-3">
-                  <MetadataForm doc={doc} />
-                </td>
-                <td className="px-4 py-3">
-                  <StatusBadge status={doc.status} />
-                  {doc.metadata_confirmed && (
-                    <div className="mt-1 text-xs text-green-700">metadata confirmed</div>
-                  )}
-                </td>
-                <td className="px-4 py-3">{chunkCounts.get(doc.id) ?? 0}</td>
-                <td className="px-4 py-3">
-                  <FlagBadge flags={flagsByDoc.get(doc.id) ?? []} />
-                </td>
-                <td className="max-w-xs px-4 py-3 whitespace-pre-wrap text-red-700">
-                  {doc.error_message ?? ""}
-                </td>
-                <td className="px-4 py-3">
-                  <div className="flex flex-col items-start gap-2">
-                    {doc.status === "failed" && (
-                      <form action={retryDocument}>
-                        <input type="hidden" name="id" value={doc.id} />
-                        <button
-                          type="submit"
-                          className="rounded bg-amber-600 px-2 py-1 text-xs text-white hover:bg-amber-700"
-                        >
-                          Retry
-                        </button>
-                      </form>
+            {visibleDocs.map((doc) => {
+              const live = liveStatuses.get(doc.id);
+              const status = live?.status ?? doc.status;
+              const errorMessage = live?.error_message ?? doc.error_message;
+              return (
+                <tr
+                  key={doc.id}
+                  className="border-b border-gray-100 align-top last:border-b-0 hover:bg-gray-50"
+                >
+                  <td className="px-4 py-3">
+                    <Link
+                      href={`/documents/${doc.id}`}
+                      className="font-medium text-blue-700 hover:underline"
+                    >
+                      {doc.file_name}
+                    </Link>
+                    <div className="text-xs text-gray-500">{doc.page_count ?? "?"} pages</div>
+                  </td>
+                  <td className="px-4 py-3">
+                    <MetadataForm doc={doc} />
+                  </td>
+                  <td className="px-4 py-3">
+                    <StatusBadge status={status} />
+                    {doc.metadata_confirmed && (
+                      <div className="mt-1 text-xs text-green-700">metadata confirmed</div>
                     )}
-                    <form action={deleteDocument}>
-                      <input type="hidden" name="id" value={doc.id} />
-                      <ConfirmSubmitButton
-                        label="Delete"
-                        confirmText={`Delete ${doc.file_name}? This also deletes its chunks.`}
-                        className="rounded bg-red-600 px-2 py-1 text-xs text-white hover:bg-red-700"
+                  </td>
+                  <td className="px-4 py-3">{chunkCounts.get(doc.id) ?? 0}</td>
+                  <td className="px-4 py-3">
+                    <FlagBadge flags={flagsByDoc.get(doc.id) ?? []} />
+                  </td>
+                  <td className="max-w-xs px-4 py-3 whitespace-pre-wrap text-red-700">
+                    {errorMessage ?? ""}
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex flex-col items-start gap-2">
+                      {status === "failed" && (
+                        <form action={retryDocument}>
+                          <input type="hidden" name="id" value={doc.id} />
+                          <button
+                            type="submit"
+                            className="rounded bg-amber-600 px-2 py-1 text-xs text-white hover:bg-amber-700"
+                          >
+                            Retry
+                          </button>
+                        </form>
+                      )}
+                      <ReprocessControls
+                        documentId={doc.id}
+                        fileName={doc.file_name}
+                        status={status}
+                        hasManualChunkToggles={manualChunkToggles.get(doc.id) ?? false}
                       />
-                    </form>
-                  </div>
-                </td>
-              </tr>
-            ))}
+                      <form action={deleteDocument}>
+                        <input type="hidden" name="id" value={doc.id} />
+                        <ConfirmSubmitButton
+                          label="Delete"
+                          confirmText={`Delete ${doc.file_name}? This also deletes its chunks.`}
+                          className="rounded bg-red-600 px-2 py-1 text-xs text-white hover:bg-red-700"
+                        />
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
             {visibleDocs.length === 0 && (
               <tr>
                 <td colSpan={7} className="px-4 py-6 text-center text-gray-400">
