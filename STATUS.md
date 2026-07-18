@@ -748,30 +748,88 @@ click approve. Repeat for every manual we use at work.
     `:target` highlight) and the upload flow end-to-end are **not**
     verified against real data/browser — can't be, no credentials or a
     browser with real corpus data available here.
+- [x] **Graph deep-dive round 2** — asked "are these real links or is it
+      making stuff up" (answered: real cosine-similarity math over real
+      embeddings, same operator/index the future chat app will use for
+      retrieval, but an honest proxy, not semantic understanding — see the
+      session log entry below for the full answer). Then asked for
+      improvements before loading the real corpus; picked click-to-preview,
+      search-and-highlight, and topic clustering (declined live filter
+      controls). All three built on `main` (still no real Supabase here):
+  - **Click-to-preview panel:** clicking a chunk node no longer navigates
+    away — it opens a side panel (`GraphPreviewPanel`) showing the full
+    chunk content, section/page/extraction-path/token-count, and its
+    similarity-scored neighbours (clickable, so you can "surf" the graph
+    from inside the panel). Content is fetched on demand per click
+    (`getChunkContent` server action) rather than shipped for every node up
+    front, so the initial `/graph` payload stays light as the corpus grows
+    — the page now only fetches lightweight chunk metadata, not `content`.
+    A "Open in document" link still does the full navigate-and-highlight
+    when you want complete context.
+  - **Search-and-highlight:** a search box embeds the query with
+    `input_type="query"` (a new `corpus embed-query <text> --json` CLI
+    command, reusing `providers.py` rather than duplicating a NIM call in
+    TypeScript) and ranks every chunk against it via a new
+    `search_chunks(query_embedding, match_count)` Postgres function (same
+    HNSW-indexed top-K pattern as `chunk_similarity_edges`). Matches
+    highlight on the graph (real color, enlarged) while everything else
+    fades — this is genuinely a live preview of what the future RAG chat
+    app would retrieve for a given question, not just a graph gimmick.
+  - **Topic clustering:** a "Color: cluster" toggle recolors nodes by
+    connected component (union-find over the currently-displayed edges,
+    computed client-side, `lib/clustering.ts`) instead of by source
+    document — reveals cross-document groupings (e.g. every manual's
+    zone-wiring chunks clustering together regardless of manufacturer).
+    Deliberately not real ML topic modeling — documented in the code as an
+    honest, cheap proxy: chunks sharing a component means "there's a chain
+    of similar-enough chunks connecting them," not necessarily "a human
+    would call this the same topic." Clusters of 1 (orphans) fade to gray
+    so real 2+-chunk groupings visually stand out.
+  - **Document-level zoom-out** (built alongside clustering since it's a
+    natural pairing): a "Chunks" / "Documents" toggle switches to a
+    coarser graph where nodes are whole documents and edges are the
+    average similarity across all cross-document chunk pairs, computed
+    client-side from the same edge data already fetched (no new query).
+    Clicking a document node navigates straight to it — no preview panel
+    at that zoom level, since the document page already is the preview.
+  - Verified the two new pure-logic pieces standalone before wiring them
+    into React (this sandbox can't render canvas/DOM, so this is where the
+    real correctness checking happened): the union-find clustering function
+    against a hand-built graph (chain + pair + isolated node → 3 correct
+    components), and the document-level aggregation logic (same-document
+    edges excluded, cross-document pairs correctly averaged with a
+    contributing-pair count).
+  - `tsc --noEmit` clean, `next build` succeeds across all four routes,
+    `next dev` still serves all of them with the expected clean
+    credentials-missing error. `npm audit`: same 2 pre-existing
+    Next-bundled-postcss vulnerabilities, nothing new.
+  - **Not verified:** the actual click/search/cluster interactions in a
+    real browser against real embeddings — needs your machine.
 - [ ] **Needs to happen on your machine:**
-  1. `git pull`. `cd review-ui && npm install` (picks up
-     `react-force-graph-2d`). Apply the new migration
-     (`supabase/migrations/..._chunk_similarity_edges.sql`) the same way
-     the initial schema was applied (manual `DATABASE_URL`/`psycopg2` apply
-     unless you've since confirmed the GitHub integration auto-applies).
+  1. `git pull`. `cd review-ui && npm install`. Apply both new migrations
+     (`chunk_similarity_edges` from last round if not already applied, and
+     the new `search_chunks`) the same way the initial schema was applied.
   2. `npm run dev`, open `http://localhost:3000`.
-  3. **Upload:** pick a real PDF via the new upload form on the queue view,
-     confirm it redirects to the document page with the "uploaded" banner,
-     and that it actually starts processing (status moves off `queued`
-     within the auto-refresh interval).
-  4. **Graph:** once at least one document has embedded chunks, open
-     `/graph` and confirm nodes render, are colored per document, and
-     clicking one navigates to and highlights the right chunk on the
-     document page. With few documents this may look sparse/mostly
-     unconnected — that's expected, not a bug.
-  5. **UX pass:** confirm the queue/document pages now auto-update while
-     something's processing (no manual reload needed), and that the new
-     card-based layout/nav feel like a real improvement — flag anything
-     that still feels off.
-  6. Once that's confirmed, M5 (plus this follow-up round) is genuinely
-     done. M6 is loading the real 5-panel corpus — no more code needed for
-     that, just running the pipeline for real and reviewing every document
-     (the graph should get meaningfully more interesting once that's in).
+  3. **Upload + Graph basics:** confirm from last round still work (upload
+     starts processing; graph nodes render/color/link correctly, clicking
+     highlights the right chunk on the document page via the "Open in
+     document" link).
+  4. **Preview panel:** click a node on `/graph` — confirm the side panel
+     opens with real content (not stuck on "Loading…"), shows sane
+     neighbours with sensible similarity percentages, and that clicking a
+     neighbour re-selects it in place.
+  5. **Search:** type something you know is in a loaded manual (e.g. a
+     section heading or a distinctive phrase), confirm matching nodes
+     highlight and the match count looks plausible — this is the first
+     real test of whether the embedding search is actually useful,
+     independent of the graph.
+  6. **Clustering:** toggle "Color: cluster" once there's more than one
+     document loaded, eyeball whether same-colored chunks across different
+     manuals actually read as related content to a human, or if it's noise
+     — this is exactly the "is it actually smart" question from earlier,
+     now testable with real data.
+  7. Once that's confirmed, this follow-up round is done. M6 is loading the
+     rest of the real 5-panel corpus — no more code needed for that.
 
 ## 11. Session log
 
@@ -791,3 +849,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Pulled M4, `pytest` 41/41, set `NIM_LLM_MODEL=meta/llama-3.3-70b-instruct` (was blank). Metadata inference on the real Enforcer V11 manual: panel_model/doc_type/revision came back clean, but `manufacturer` came back with the model's reasoning baked into the value instead of a clean string (e.g. `"Pyronix (implied, not explicitly stated but...)"`)  — reproduced the same pattern on a second document, confirming it's systemic, not a fluke. `corpus retry` tested against a genuine forced failure (bogus embed model), not just idempotency: confirmed failed→retry→review with the error cleared, no duplicate chunks, no wasted NIM calls on stages that already succeeded — also confirmed 0 wasted work retrying an already-successful document. Cleaned up both test documents afterward (source PDFs untouched). | Decide how to stop the LLM from writing prose into manufacturer/revision fields (tighten prompt further vs. add post-processing validation) before M5's review UI needs to show these as clean editable fields. Otherwise M4 is done — start M5 (review UI). |
 | 2026-07-18 | M5 built on `main` (sandbox again has no real Supabase): `review-ui/`, a minimal Next.js 16 App Router + TypeScript + Tailwind v4 app with the queue view and document view from STATUS.md §5. Queue view's metadata fields are plain editable inputs (not read-only) specifically because of the prose-in-manufacturer/revision finding from the last session — review here means "look and fix," which is the mitigation for that still-open decision. Retry button shells out to `python -m corpus.cli retry <id>` as a detached background process rather than reimplementing retry logic in JS. Hit and root-caused a real build break: `npm install` resolved `typescript` to `7.0.2`, which crashed Next's internal type-check with an opaque low-level Node error; pinned to `^5.9.3` (what Next 16.2.10 actually expects) after confirming via `ignoreBuildErrors` that the crash was specifically in the TS step. `next build` (Turbopack, the default) succeeds cleanly; noted but didn't chase a separate `--webpack` path-alias resolution failure since Turbopack is what this app actually uses. `next dev` boots and both routes correctly fail with a clean "SUPABASE_URL / SUPABASE_SERVICE_KEY are not set" 500 rather than crashing, since no real Supabase is reachable from here. | Pull, `npm install`, set up `review-ui/.env.local` from the example (same Supabase creds as `pipeline/.env`, plus CORPUS_PYTHON/CORPUS_PIPELINE_DIR for Retry), `npm run dev`, and actually use it in a browser against real data: open a document, check chunk rendering, edit/confirm metadata, approve a review-status doc, retry a failed one if any exist, delete a disposable test doc and confirm its chunks vanish too. Then M5 is done — M6 is loading the real 5-panel corpus, no more code needed for that. |
 | 2026-07-18 | Tried the M5 review UI and gave feedback: no way to add a document from the UI, no visual way to see how documents/chunks relate, and the UI generally isn't user-friendly (asked specifically: no progress feedback, bare-bones design, hard to navigate). Confirmed chunk-level (not document-level) similarity graph is what's wanted, to be built now rather than deferred past M6. Built on `main` (sandbox still has no real Supabase): upload form + `uploadDocument` server action + `corpus ingest --json`; `/graph` page using `react-force-graph-2d` + a new `chunk_similarity_edges` Postgres function (HNSW-indexed per-chunk nearest-neighbours, not a full pairwise scan) exposed via Supabase RPC; persistent nav header, card-based layout, `AutoRefresh` polling component, and a pulsing status-dot for in-progress documents. `tsc`/`next build` clean across all three routes; `npm audit` shows no new vulnerabilities from the new dependency. Upload flow and graph rendering not verified against real data/browser (no credentials here). | Pull, `npm install`, apply the new `chunk_similarity_edges` migration, `npm run dev`, and actually use it: upload a real PDF, confirm it starts processing; open `/graph` once chunks are embedded and check nodes render/color/link correctly and clicking one highlights the right chunk; sanity-check the auto-refresh and new layout feel like a real improvement. Then this follow-up round (and M5 overall) is done — on to M6. |
+| 2026-07-18 | Asked whether the graph edges are "real links or making it up." Answer given: real cosine similarity over real embeddings (same pgvector operator/HNSW index the future chat app will use for retrieval at query time), not fabricated — but honestly limited to "these texts read as linguistically similar," which usually but not always tracks genuine topical relevance (boilerplate/table-structure text can false-positive; genuinely related content phrased differently can false-negative), and the 0.78/top-5 defaults are unvalidated guesses since there's barely any real corpus loaded yet. Then asked for improvements to actually understand the corpus before adding real files; picked click-to-preview, search-and-highlight, and topic clustering (declined a live threshold-filter slider). Built on `main` (still no real Supabase): `GraphPreviewPanel` (click a node, see full content + scored neighbours in a side panel, content fetched on demand via a new `getChunkContent` action so the graph page itself stays lightweight — dropped `content` from its chunk query entirely); search box wired to a new `corpus embed-query --json` CLI command (reuses `providers.py`, doesn't duplicate the NIM call in TS) + a new `search_chunks` Postgres function, highlighting matching nodes and fading the rest; a "Color: cluster" toggle using client-side union-find over the displayed edges (`lib/clustering.ts`) as an honest, documented-as-approximate stand-in for real topic modeling; a "Chunks"/"Documents" view toggle for a document-level zoom-out, aggregated client-side from the same edge data. Verified the two new pure-logic pieces (union-find, document-edge aggregation) standalone with hand-built test graphs before wiring into React, since this sandbox can't render canvas. `tsc`/`next build` clean across all four routes, no new `npm audit` findings. Interaction behavior (actual clicks/search/clustering against real embeddings) not verified — needs a real browser and real data. | Pull, install, apply both new migrations, `npm run dev`. Confirm the preview panel loads real content, run a real search query and sanity-check the matches, and — the actually interesting test — toggle cluster coloring once more than one document is loaded and judge honestly whether same-colored chunks across manuals read as related to a human, which is the real answer to "is this actually smart." Then start loading the rest of the real corpus (M6). |

@@ -113,6 +113,19 @@ def ingest(path: Path, as_json: bool):
         click.echo(f"Ingested {path.name} -> document {row['id']} (status=queued)")
 
 
+@main.command(name="embed-query")
+@click.argument("text")
+def embed_query(text: str):
+    """Embed a single string with input_type='query'; prints {"embedding": [...]}
+    as JSON. Used by review-ui's search-and-highlight feature to preview what
+    the future chat app would retrieve for a given question — same embedding
+    model, same NIMClient, via providers.py rather than duplicating the NIM
+    call in TypeScript."""
+    client = NIMClient()
+    vector = client.embed([text], input_type="query")[0]
+    click.echo(json.dumps({"embedding": vector}))
+
+
 @main.command()
 @click.argument("document_id")
 def process(document_id: str):

@@ -1,5 +1,6 @@
 import { getSupabaseAdmin } from "@/lib/supabase";
-import { GraphCanvas, type GraphLink, type GraphNode } from "@/components/GraphCanvas";
+import { GraphExplorer, type ExplorerChunk, type ExplorerDocument } from "@/components/GraphExplorer";
+import type { GraphLink } from "@/components/GraphCanvas";
 
 export const dynamic = "force-dynamic";
 
@@ -15,20 +16,15 @@ interface ChunkRow {
   chunk_index: number;
   section: string | null;
   page_start: number | null;
-  content: string;
+  page_end: number | null;
+  extraction_path: string | null;
+  token_count: number | null;
 }
 
 interface EdgeRow {
   chunk_id: string;
   neighbor_id: string;
   similarity: number;
-}
-
-// Golden-angle hue rotation gives well-separated colors for an unknown
-// number of documents without needing a fixed palette.
-function colorForIndex(i: number): string {
-  const hue = (i * 137.508) % 360;
-  return `hsl(${hue.toFixed(0)}, 65%, 50%)`;
 }
 
 export default async function GraphPage() {
@@ -39,9 +35,14 @@ export default async function GraphPage() {
     .select("id, file_name")
     .order("created_at", { ascending: true });
 
+  // Deliberately no `content` here — that's fetched on demand per chunk by
+  // the preview panel (getChunkContent) so this page stays light as the
+  // corpus grows into hundreds/thousands of chunks.
   const { data: chunks, error: chunksError } = await supabase
     .from("chunks")
-    .select("id, document_id, chunk_index, section, page_start, content")
+    .select(
+      "id, document_id, chunk_index, section, page_start, page_end, extraction_path, token_count"
+    )
     .not("embedding", "is", null)
     .returns<ChunkRow[]>();
 
@@ -70,66 +71,68 @@ export default async function GraphPage() {
     );
   }
 
-  const docList = documents ?? [];
-  const docColor = new Map<string, string>();
-  const docName = new Map<string, string>();
-  docList.forEach((d, i) => {
-    docColor.set(d.id, colorForIndex(i));
-    docName.set(d.id, d.file_name);
-  });
+  const docList: ExplorerDocument[] = (documents ?? []).map((d) => ({
+    id: d.id,
+    fileName: d.file_name,
+  }));
+  const docName = new Map(docList.map((d) => [d.id, d.fileName]));
 
-  const nodes: GraphNode[] = (chunks ?? []).map((c) => ({
+  const explorerChunks: ExplorerChunk[] = (chunks ?? []).map((c) => ({
     id: c.id,
     documentId: c.document_id,
     documentName: docName.get(c.document_id) ?? "?",
-    label: c.section
-      ? `${c.section} (p.${c.page_start ?? "?"})`
-      : `#${c.chunk_index} (p.${c.page_start ?? "?"}) — ${c.content.slice(0, 60)}`,
-    color: docColor.get(c.document_id) ?? "#888888",
+    chunkIndex: c.chunk_index,
+    section: c.section,
+    pageStart: c.page_start,
+    pageEnd: c.page_end,
+    extractionPath: c.extraction_path,
+    tokenCount: c.token_count,
   }));
 
   const seenPairs = new Set<string>();
-  const links: GraphLink[] = [];
+  const edges: GraphLink[] = [];
   for (const row of edgeRows ?? []) {
     const [a, b] = [row.chunk_id, row.neighbor_id].sort();
     const key = `${a}|${b}`;
     if (seenPairs.has(key)) continue;
     seenPairs.add(key);
-    links.push({ source: row.chunk_id, target: row.neighbor_id, similarity: row.similarity });
+    edges.push({ source: row.chunk_id, target: row.neighbor_id, similarity: row.similarity });
   }
 
   return (
     <main className="mx-auto max-w-6xl px-8 py-8">
       <h1 className="mb-2 text-2xl font-semibold text-gray-900">Chunk Graph</h1>
       <p className="mb-4 text-sm text-gray-600">
-        {nodes.length} embedded chunks across {docList.length} document
+        {explorerChunks.length} embedded chunks across {docList.length} document
         {docList.length === 1 ? "" : "s"}. An edge means embedding cosine
         similarity &ge; {SIMILARITY_THRESHOLD} (top {MAX_NEIGHBORS} neighbours
-        per chunk). Chunks with no close match appear unconnected — click any
-        node to open it in its document.
+        per chunk). Chunks with no close match appear unconnected.
       </p>
 
       {docList.length > 0 && (
         <div className="mb-4 flex flex-wrap gap-x-4 gap-y-2 rounded-lg border border-gray-200 bg-white p-3 text-xs">
-          {docList.map((d, i) => (
-            <span key={d.id} className="flex items-center gap-1.5">
-              <span
-                className="inline-block h-2.5 w-2.5 rounded-full"
-                style={{ backgroundColor: colorForIndex(i) }}
-              />
-              <span className="text-gray-700">{d.file_name}</span>
-            </span>
-          ))}
+          {docList.map((d, i) => {
+            const hue = (i * 137.508) % 360;
+            return (
+              <span key={d.id} className="flex items-center gap-1.5">
+                <span
+                  className="inline-block h-2.5 w-2.5 rounded-full"
+                  style={{ backgroundColor: `hsl(${hue.toFixed(0)}, 65%, 50%)` }}
+                />
+                <span className="text-gray-700">{d.fileName}</span>
+              </span>
+            );
+          })}
         </div>
       )}
 
-      {nodes.length === 0 ? (
+      {explorerChunks.length === 0 ? (
         <p className="rounded-lg border border-dashed border-gray-300 bg-white p-6 text-center text-gray-500">
           No embedded chunks yet — the graph fills in once documents finish
           processing.
         </p>
       ) : (
-        <GraphCanvas nodes={nodes} links={links} />
+        <GraphExplorer chunks={explorerChunks} documents={docList} edges={edges} />
       )}
     </main>
   );

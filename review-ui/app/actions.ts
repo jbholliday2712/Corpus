@@ -135,3 +135,46 @@ export async function uploadDocument(formData: FormData): Promise<void> {
   revalidatePath("/");
   redirect(`/documents/${id}?${duplicate ? "duplicate" : "uploaded"}=1`);
 }
+
+export async function getChunkContent(chunkId: string): Promise<string> {
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("chunks")
+    .select("content")
+    .eq("id", chunkId)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data?.content ?? "";
+}
+
+export async function searchChunks(
+  query: string
+): Promise<{ chunkId: string; similarity: number }[]> {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+
+  const { pythonBin, pipelineDir } = requirePipelineEnv();
+
+  // Embeds with the same provider/model the pipeline used to embed every
+  // chunk (input_type="query", matching STATUS.md's "same embedding model
+  // must be used at query time" rule) via the existing providers.py, rather
+  // than duplicating a NIM call in TypeScript.
+  const { stdout } = await execFileAsync(
+    pythonBin,
+    ["-m", "corpus.cli", "embed-query", trimmed, "--json"],
+    { cwd: pipelineDir }
+  );
+  const { embedding } = JSON.parse(stdout.trim()) as { embedding: number[] };
+
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase.rpc("search_chunks", {
+    query_embedding: embedding,
+    match_count: 40,
+  });
+  if (error) throw new Error(error.message);
+
+  return ((data ?? []) as { chunk_id: string; similarity: number }[]).map((row) => ({
+    chunkId: row.chunk_id,
+    similarity: row.similarity,
+  }));
+}
