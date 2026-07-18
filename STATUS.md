@@ -402,21 +402,50 @@ click approve. Repeat for every manual we use at work.
     white page with a small logo) could produce confident-sounding nonsense
     that goes straight into the corpus.
   - Cleaned up the test document (Supabase row + `store/`/`work/` files)
-    afterward.
-- [ ] **Decision needed before M3 is actually safe to run on real manuals:**
-  how to guard against vision-model repetition loops — options include
-  detecting repeated N-line blocks in `vision_transcribe`'s output and
-  truncating, lowering `max_tokens` so a loop can't run as far, trying a
-  different/larger vision model less prone to this at `temperature=0`, or
-  accepting the risk for now and catching it manually in the review UI once
-  that exists (risky: review UI doesn't exist yet, and this burns real NIM
-  quota/embeddings before anyone looks at it). Not fixed yet — needs a call
-  on which approach, then implementation.
-- [ ] Once that's decided, run M3 again on "the ugliest manual I've got" (a
-      real scanned/table-heavy PDF, not synthetic) via `corpus watch` and
-      eyeball `chunks.extraction_path` + content quality in Supabase. Then
-      M4 (metadata inference + failure handling) can start, needs
-      `NIM_LLM_MODEL` set.
+    afterward. The hallucination-on-blank-page risk noted above is a
+    separate, still-open concern — not addressed here, this task was
+    specifically the repetition-loop fix.
+- [x] **Repetition-loop guard implemented** — the decision above is resolved:
+  `providers.py`: `_detect_repetition(text)` added, called right before
+      `vision_transcribe` returns — catches a vision model looping on the
+      same paragraph (or a 2-3 paragraph cycle) 3+ times in a row (e.g. the
+      same table pasted 30 times) and truncates to one copy, before it ever
+      reaches `chunk.py` or costs an embedding call. Deliberately cheaper
+      and safer than just lowering `max_tokens`: a smaller cap only shrinks
+      the blast radius (3-4 copies instead of 30), it doesn't fix it, and a
+      hard cutoff can slice a genuinely long legitimate table in half.
+  - "Near-exact" match is whitespace-normalization only, not fuzzy
+    similarity — tried a `difflib.SequenceMatcher` ratio first and caught a
+    real bug with it: sequential-but-distinct table rows (e.g. `Zone 0 /
+    Addr 000` vs `Zone 1 / Addr 001`) differ by only 1-2 characters out of
+    ~30, so a 0.9 similarity threshold flagged them as "the same" repeating
+    row and truncated a legitimate 40-row table down to one row. Dropped
+    the fuzzy fallback; whitespace normalization alone still catches actual
+    repeat loops (which re-emit byte-identical or whitespace-jittered text)
+    without conflating them with rows that are merely similar-looking.
+  - `tests/test_providers.py` (10 tests): single-paragraph and 2-3
+    paragraph cycles truncated at 3+ reps, exactly-2 reps left alone (with
+    and without a preceding paragraph), whitespace-only near-exact variants
+    caught, sequentially-different rows explicitly *not* flagged (the
+    regression test for the false positive above), a long non-repeating
+    table left untouched, short output left untouched. 27/27 passing
+    overall (pipeline-wide).
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`, reinstall (`pip install -e ".[dev]"` — no new deps), `pytest`
+     → should show 27 passed.
+  2. `NIM_VISION_MODEL` needs to actually be set in `.env` for this to do
+     anything real — check `corpus check`, fill it in if still blank.
+  3. Test with "the ugliest manual I've got" per the M3 brief: a scanned or
+     table-heavy PDF, via `corpus watch` or `ingest` + `process`. Watch the
+     `extract` step's timing — vision calls are sequential and can be slow,
+     that's expected (STATUS.md: "speed doesn't matter").
+  4. Eyeball `chunks.extraction_path` in Supabase — vision-derived chunks
+     should be flagged, and their `content` should look like sane markdown
+     transcription, not garbage or a refusal from the vision model.
+  5. Once that looks right (including no leftover duplicate-table chunks —
+     `_detect_repetition` should have caught it before it got that far),
+     M3 is done; M4 (metadata inference + failure handling/`corpus retry`)
+     needs `NIM_LLM_MODEL` set.
 
 ## 11. Session log
 
@@ -429,3 +458,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Pulled M2 onto the laptop and ran it against real Supabase/NIM: `pytest` 7/7, then a synthetic 3-page PDF through `ingest` → `process` → verified `documents`/`chunks` rows in Supabase (table + procedure stayed intact in one chunk, embedding genuinely 1024 dims), then cleaned the test doc out. Mechanics confirmed working end-to-end. | Run the same flow against a real manual (not synthetic) to sign off M2 for real, then start M3 (vision path + triage) once `NIM_VISION_MODEL` is set. |
 | 2026-07-18 | M3 built on `main` (sandbox again has no `.env`). Added triage (`needs_vision`: thin-text-but-not-blank, or table-dense heuristics) and the vision extraction path to `extract.py`, a page-marker format so `chunk.py` knows which pages were vision-derived, and per-chunk `extraction_path` propagation. 10 new tests (17/17 total). Manually traced triage → page files → chunking against a synthetic mixed text/scanned PDF with the actual NIM call simulated (no credentials in this sandbox). | Run it for real: pull, install, `pytest` (17 passed expected), confirm `NIM_VISION_MODEL` is set, then feed it an actual scanned/table-heavy manual and check `chunks.extraction_path` + content quality in Supabase. Report back so M4 (metadata inference + failure handling) can start. |
 | 2026-07-18 | Pulled M3, `pytest` 17/17, set `NIM_VISION_MODEL=meta/llama-3.2-11b-vision-instruct` (was blank). Ran a synthetic mixed-content PDF (prose/scanned-looking/table-dense pages) through the real pipeline: triage routed all three pages correctly, and vision genuinely improved on a dense table PyMuPDF would've flattened. **Also found the vision model can fall into a degenerate repetition loop on grid-like content** — repeated a 20-row table ~30 times until hitting `max_tokens=4096`, which the chunker then dutifully packed into several near-duplicate chunks. Not a chunker bug; a missing safeguard between the vision call and the DB insert. Cleaned up the test document afterward. | Decide how to guard against vision repetition loops (detect+truncate, lower max_tokens, different model, or accept-and-catch-in-review-later) before trusting M3 on a real manual. Then test on an actual scanned/table-heavy PDF and start M4. |
+| 2026-07-18 | Added `_detect_repetition` to `providers.py` (requested addition to M3): truncates a vision response that loops on the same paragraph/short cycle 3+ times in a row, called right before `vision_transcribe` returns. First implementation used a `difflib` fuzzy-similarity fallback for "near-exact" matching; a test with a long legitimate incrementing table (`Zone 0/Addr 000`, `Zone 1/Addr 001`, ...) caught it wrongly collapsing the table to one row, because sequential rows differing by one digit are >90% similar by that metric. Fixed by dropping the fuzzy fallback — "near-exact" is now whitespace-normalization only, which still catches real repeat loops without conflating them with genuinely-different similar-looking rows. 10 new tests (27/27 total), including a regression test for that false positive. | Pull and run `pytest` (27 passed expected) on the laptop; no live vision call needed to verify this since it's pure text-in/text-out, but worth eyeballing `chunks.content` next time a real vision-heavy manual goes through, in case a genuine repeat loop shows up and gets truncated. Then M4 (metadata inference + failure handling). |
