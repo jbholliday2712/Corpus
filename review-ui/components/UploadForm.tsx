@@ -13,7 +13,7 @@ function SubmitButton() {
     >
       <span className="inline-flex items-center gap-1.5">
         {pending && <Spinner />}
-        {pending ? "Uploading…" : "Upload PDF"}
+        {pending ? "Uploading…" : "Upload PDFs"}
       </span>
     </button>
   );
@@ -33,13 +33,17 @@ export function UploadForm({
         type="file"
         name="file"
         accept="application/pdf"
+        multiple
         required
         className="text-sm"
       />
       <SubmitButton />
       <span className="text-xs text-gray-500">
-        Ingests the PDF and starts extract → metadata → chunk → embed in the
-        background.
+        Select one PDF or many (ctrl/cmd-click, or select-all inside a
+        folder) — each one is ingested and starts extract → metadata →
+        clean → chunk → embed in the background. For bulk-loading a whole
+        folder from the command line instead, see{" "}
+        <code>corpus ingest-dir</code>.
       </span>
     </form>
   );

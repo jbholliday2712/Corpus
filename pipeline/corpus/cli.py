@@ -132,6 +132,58 @@ def ingest(path: Path, as_json: bool):
         click.echo(f"Ingested {path.name} -> document {row['id']} (status=queued)")
 
 
+@main.command(name="ingest-dir")
+@click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--process/--no-process",
+    default=False,
+    help="Also run extract->metadata->clean->chunk->embed for each newly-ingested "
+    "document, one at a time (can take a while for many/vision-heavy PDFs). "
+    "Without this, documents are left status=queued for `corpus watch` (or a "
+    "later `corpus ingest-dir --process`) to pick up.",
+)
+def ingest_dir(directory: Path, process: bool):
+    """Bulk-ingest every PDF directly inside DIRECTORY in one shot — the
+    one-shot alternative to dropping files into inbox/ and leaving `corpus
+    watch` running. Duplicates (by content hash) are skipped like a normal
+    ingest; one bad PDF is reported and skipped rather than aborting the
+    rest of the batch, matching `watch`'s per-file failure handling."""
+    pdfs = sorted(directory.glob("*.pdf"))
+    if not pdfs:
+        click.echo(f"No PDFs found in {directory}")
+        return
+
+    ingested_ids: list[str] = []
+    duplicates = 0
+    failed = 0
+    for pdf in pdfs:
+        try:
+            row = intake.ingest(pdf)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  FAILED to ingest {pdf.name}: {exc}")
+            failed += 1
+            continue
+        if row.get("duplicate"):
+            click.echo(f"  Duplicate (already ingested as {row['id']}): {pdf.name}")
+            duplicates += 1
+            continue
+        click.echo(f"  Ingested {pdf.name} -> document {row['id']} (status=queued)")
+        ingested_ids.append(row["id"])
+
+    click.echo(
+        f"\n{len(ingested_ids)} ingested, {duplicates} duplicate(s), {failed} failed, "
+        f"out of {len(pdfs)} PDF(s) found."
+    )
+
+    if process and ingested_ids:
+        click.echo("\nProcessing...")
+        for document_id in ingested_ids:
+            try:
+                _process(document_id)
+            except Exception as exc:  # noqa: BLE001
+                click.echo(f"  FAILED to process {document_id}: {exc}")
+
+
 @main.command(name="embed-query")
 @click.argument("text")
 def embed_query(text: str):

@@ -229,7 +229,13 @@ Pages:
    status/error updates without a full page re-render. Every button that
    kicks off a background run (retry/reprocess/reset/approve/restore/
    upload) shows a spinner for the moment the request itself is in flight,
-   not just a static label.
+   not just a static label. Upload accepts one PDF or many at once
+   (`<input multiple>`) — a single upload keeps the original
+   redirect-to-that-document UX, a bulk upload redirects back to the queue
+   with an ingested/duplicate/failed summary banner; one bad PDF in a
+   batch doesn't abort the rest, matching `corpus watch`'s per-file
+   handling. The CLI-side equivalent for a whole folder without opening a
+   browser is `corpus ingest-dir <path> [--process]`.
 2. **Document view** — chunks in order, rendered as markdown, showing page
    range, section, extraction path, token count per chunk. This is the
    inspection hatch: I check tables survived and sections make sense.
@@ -261,7 +267,7 @@ corpus/
 ├── pipeline/              ← Python
 │   ├── pyproject.toml
 │   ├── corpus/
-│   │   ├── cli.py         ← entrypoints: ingest, watch, retry,
+│   │   ├── cli.py         ← entrypoints: ingest, ingest-dir, watch, retry,
 │   │   │                     restore-furniture, reprocess, reset,
 │   │   │                     embed-query, status
 │   │   ├── intake.py
@@ -281,8 +287,10 @@ corpus/
 │       ├── test_chunk.py
 │       ├── test_clean.py  ← the furniture detector is the other thing
 │       │                     worth unit-testing
-│       └── test_reprocess.py ← monkeypatched db/clean/chunk/embed, asserts
-│                                 call order + idempotency per from-stage
+│       ├── test_reprocess.py ← monkeypatched db/clean/chunk/embed, asserts
+│       │                        call order + idempotency per from-stage
+│       └── test_cli.py    ← CliRunner argv/orchestration tests
+│                              (ingest-dir batch/duplicate/failure handling)
 ├── review-ui/             ← Next.js app (App Router)
 ├── inbox/                 ← drop PDFs here (gitignored)
 ├── store/                 ← content-addressed PDF copies (gitignored)
@@ -1355,6 +1363,63 @@ click approve. Repeat for every manual we use at work.
      threshold is too aggressive on a real corpus (a legitimately-reused
      heading losing its `section` label 3+ times in) — if so, it's a
      one-constant change (`_MIN_REPEATED_HEADING_PAGES` in `chunk.py`).
+- [x] **Bulk folder drop.** Asked about auto-discovering/scraping manuals
+      from the internet; discussed the idea rather than building it
+      straight away (real accuracy/legal/site-fragility concerns for
+      autonomous discovery — see session log), and the user picked the
+      lower-risk, immediately useful piece instead: making it faster to
+      load many manuals at once without a scraper. Built on `main`
+      (sandbox still has no real Supabase/NIM):
+  - New `corpus ingest-dir <directory> [--process]` CLI command: ingests
+    every `*.pdf` directly inside a folder in one shot (the one-shot
+    alternative to dropping files in `inbox/` and leaving `corpus watch`
+    running indefinitely). Duplicates skipped like a normal ingest; one
+    bad PDF is reported and skipped, not fatal to the batch — same
+    per-file failure handling `watch` already uses. `--process` additionally
+    runs the full pipeline for each newly-ingested document, sequentially,
+    reusing `_process` (no new pipeline logic, pure orchestration in
+    `cli.py`, consistent with how every other command is just a thin
+    wrapper). 5 new tests in a new `tests/test_cli.py` (the project's
+    first CLI-level test file — uses `CliRunner` + monkeypatched
+    `intake.ingest`/`_process` to verify the batch/duplicate-counting/
+    one-bad-file-doesn't-abort-the-rest logic without needing a real
+    PDF or Supabase). 88/88 pipeline-wide.
+  - review-ui: `UploadForm`'s file input now takes `multiple` — select one
+    PDF or many (ctrl/cmd-click, or select-all inside a folder) in the
+    browser's native picker. `uploadDocument` in `app/actions.ts` keeps
+    the original single-file UX exactly (redirect straight to that
+    document, errors surface directly) when exactly one file is selected;
+    for multiple files it ingests each in turn, catches per-file failures
+    without aborting the batch, and redirects to the queue with a summary
+    banner (`?bulkUploaded=N&bulkDuplicates=N&bulkFailed=N`). Each
+    ingested document still gets its own independent detached background
+    `corpus process` call, so a slow/vision-heavy manual in the batch
+    doesn't hold up the others.
+  - Deliberately did not build actual folder drag-and-drop (browser
+    `DataTransferItem`/`webkitGetAsEntry` handling) — the native multi-select
+    file picker already covers "select everything in a folder at once"
+    without that extra complexity; can add real drag-and-drop later if it
+    turns out to matter in practice.
+  - `tsc --noEmit` clean, `next build` succeeds across all six routes,
+    `next dev` smoke-tested locally (same expected credentials-missing
+    500). Not verified against real Supabase/NIM or a real multi-file
+    browser upload.
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`. `cd pipeline && pip install -e ".[dev]"`, `pytest` →
+     expect 88 passed. `cd review-ui && npm install` (no new deps), `npm
+     run dev`.
+  2. Try `corpus ingest-dir <a folder with a few PDFs>` (no `--process`
+     first) and confirm it lists each, correctly skips anything already
+     ingested, and reports an accurate summary count. Then try it again
+     with `--process` on a fresh folder and confirm each document actually
+     starts processing (check `corpus status` or the queue view).
+  3. In the browser, select multiple PDFs at once in the upload form and
+     confirm: the summary banner shows correct counts, every non-duplicate
+     document appears in the queue and starts processing independently,
+     and a deliberately-bad/corrupt "PDF" in the batch gets reported as
+     failed without stopping the other uploads.
+  4. Confirm the single-file upload path still behaves exactly as before
+     (redirects straight to the new document's page).
 
 ## 11. Session log
 
@@ -1380,4 +1445,5 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Tried the reprocess controls; worked, but two pieces of feedback: (1) furniture detection on a real 46-page manual (Enforcer V11 Programming Guide) only caught two repeated lines (the title header, the bare page number) — "that can't be it," expected more boilerplate to be flagged. Couldn't diagnose blind without seeing the actual raw pages (could be a threshold problem, a vision/OCR-variance matching problem, or genuinely correct for this document) — asked for a sample of what's being missed rather than guessing at a `clean.py` change; left open. (2) Wanted progress bars on running tasks generally, not just the queue's status word. Built on `main` (sandbox still has no real Supabase): new `StageProgress` component (segmented Queued/Extract/Clean&chunk/Embed/Review bar driven by `documents.status`, works for every path that moves a document through those statuses — processing, retry, reprocess — without knowing which one triggered it), replacing `StatusBadge` (deleted entirely, not left as dead code; its `ACTIVE_STATUSES` constant moved to `lib/types.ts`) in both the queue table and the document detail page. New `Spinner`/`PendingSubmitButton` components wired into every button that kicks off a background run (retry, approve, restore-furniture-line, proceed-anyway, delete, reprocess, hard reset) so a click gets immediate visual feedback instead of looking inert until the next poll. `tsc`/`next build` clean across all six routes, `next dev` smoke-tested (same expected credentials-missing 500s). | Pull, `npm install`, `npm run dev`. Check the new progress bar renders sensibly across every status and that each button shows its spinner immediately on click. Separately: reply with what furniture you'd expect flagged on the Enforcer V11 manual (or paste a couple of raw `work/<hash>/pages/*.md` files) so the detection question can actually get resolved instead of guessed at. |
 | 2026-07-18 | Root-caused the furniture-detection and confusing-graph-labels feedback from the same session down to one bug: `chunk.py`'s `_is_heading()` heuristic (short, single-line, no trailing punctuation) also matches vision-transcribed `**Label:** value` bold field lines, e.g. `**Page Number:** 4`. Once misclassified as a heading, that text becomes `chunk.section` — and thus `/graph`'s node/neighbor labels — for every chunk after it, so many unrelated chunks on many different real pages all showed the same misleading label, and clicking a "related chunk" correctly jumped to genuinely different content that just had a lying label (the edges/click behavior were never broken). Also explains why furniture detection missed it without needing the raw-page sample asked for last session: a field whose value is stuck at a constant "4" would still only appear on the subset of pages that went through the vision path, likely too few of the full 46 to cross `FURNITURE_MIN_PAGE_RATIO`. Fixed with a `_FIELD_VALUE_LINE_RE` guard in `_is_heading()`; 2 new tests (78/78 pipeline-wide) confirming the field line doesn't become `section` and doesn't clobber a real preceding heading. Not verified against the real document — the fix only helps once the affected document's chunks are regenerated. | Pull, install, `pytest` (78 passed expected). Reprocess the Enforcer V11 document **from 'chunk'** (via the reprocess controls built earlier this session) and reopen `/graph` — confirm `**Page Number:** 4`-style labels are gone and clicking a related chunk now makes sense relative to its label. Paste any other garbage label pattern that survives, rather than guessing at a broader fix up front. |
 | 2026-07-18 | Follow-up on the same real document: `/graph` also showing `**Table of Contents**` as the label for many unrelated real pages (not the actual TOC page), with high similarity scores between them. Same underlying bug class as the `**Page Number:** 4` fix earlier this session (`chunk.py`'s `_is_heading()` is too permissive), but a different literal phrase — the field-value regex didn't cover it since "Table of Contents" isn't a `Label: value` line. Generalized instead of special-casing another string: `chunk_pages` now runs a document-local pass (`_find_repeated_heading_texts`) that excludes any heading-shaped line repeating on 3+ distinct pages from ever being classified as a real heading, on the reasoning that a genuine section title is page-specific and essentially never repeats verbatim, while a much lower bar than clean.py's furniture threshold is worth it here since the failure mode of over-excluding is cheap (content is kept either way, only the `section` label falls back to the prior real heading). Also finally answers the original furniture-detection question from two sessions back without the raw-page sample that was asked for: a hallucinated phrase repeated only across the vision-processed subset of pages plausibly never reaches the furniture detector's ~30%-of-whole-document bar either. 5 new tests (83/83 pipeline-wide). Not verified against the real document — the same reprocess-from-'chunk' step covers both this and the earlier field-value fix. | Pull, install, `pytest` (83 passed expected). Reprocess the Enforcer V11 document from 'chunk' and reopen `/graph` — confirm both known garbage-label patterns are gone. If a third one shows up, paste it rather than have me guess at a broader rule. Also worth a gut check on whether 3 repeats is too aggressive once more real, larger manuals are loaded (a legitimately-reused heading text would lose its `section` label past that point) — it's a single constant to tune if so. |
+| 2026-07-18 | Asked about auto-discovering/scraping manuals from the internet given re-downloading/re-uploading each one by hand is tedious. Discussed rather than building it immediately: full autonomous scraping has real problems (matching the right manual/revision from search results is error-prone and could silently pollute the corpus with wrong documents, most manufacturer sites have no API so it'd mean fragile per-site scrapers, and bulk-automated downloading sits in a legal/ToS gray area even though a human clicking the same download link is normal) — laid out three tiers (bulk folder drop / ingest-by-URL / guided discovery-with-human-approval) and asked which to build first. Picked bulk folder drop. Built on `main` (sandbox still has no real Supabase/NIM): new `corpus ingest-dir <dir> [--process]` CLI command (one-shot bulk ingest of every PDF in a folder, `--process` to also run the full pipeline per document, one bad PDF doesn't abort the batch); review-ui's upload form now accepts multiple files at once, single-file UX unchanged, multi-file redirects to the queue with an ingested/duplicate/failed summary banner. First CLI-level test file (`test_cli.py`, 5 tests via `CliRunner` + monkeypatching) — 88/88 pipeline-wide. `tsc`/`next build` clean. Not run against real data — needs a real folder of PDFs and a real multi-file browser upload to verify. | Pull, install, `pytest` (88 passed expected), `npm run dev`. Try `corpus ingest-dir` against a real folder of manuals, and try a real multi-file browser upload including one deliberately-bad file to confirm the failure handling. Ingest-by-URL and guided discovery are still on the table if bulk drop isn't enough on its own. |
 | 2026-07-19 | Added the cleaning stage per a fully-specified task (furniture stripping, structural page/chunk tagging, runt handling, >15% safety rail, Cleaning tab, furniture-detector unit tests) — one genuine gap in the spec: the repeated-safety-warning test case referenced "(see note below)" with no note attached. Asked and got a clear answer: add a keyword exception (`warning`/`caution`/`danger`/`note:`), never auto-strip that content regardless of repetition, given this is a fire/security panel corpus. Built `clean.py` (new), updated `chunk.py` (reads cleaned pages, runt handling, structural metadata), `cli.py` (`_process` gains a clean step + early-stop on the safety rail, new `restore-furniture` command), `db.py` (`delete_chunks`), a new migration (`documents.metadata` column, graph/search RPCs updated to respect the new exclusion rule), and the review UI's new Cleaning tab. Found and fixed two real logic bugs before they shipped (not caught by the spec, caught by testing): `apply_runt_handling` initially couldn't cascade-merge multiple consecutive runts (excluded already-runt-tagged chunks as merge targets, not just structural ones); `clean_pages` initially flattened cleaned lines with a single join, silently destroying the paragraph boundaries `chunk.py`'s splitting depends on. Also worked through several of my own test-fixture bugs (templated "page N" body text registering as furniture itself) before the real test suite was trustworthy. 65/65 pipeline tests passing (14 new for `clean.py`, 10 new for runt handling), 3 hand-built end-to-end scenarios verified via monkeypatched DB (safety rail correctly passes on realistic content, correctly trips and blocks chunk/embed on sparse content, `proceed_override` correctly unsticks it), `tsc`/`next build` clean across all four routes. Nothing verified against real Supabase/NIM/manuals — same sandbox constraint as every session. | Pull, reinstall (no new deps either side), apply the new migration, `pytest` (expect 65 passed). Run a real manual through and actually judge the heuristic against real content: does furniture.json look right, does a real TOC page get tagged, does a repeated real safety warning survive, is 15% the right safety-rail threshold. Try restoring a furniture line and toggling a structural/runt chunk's retrieval inclusion for real. Then back to loading the rest of the corpus (M6). |

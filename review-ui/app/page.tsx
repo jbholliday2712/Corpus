@@ -10,9 +10,14 @@ export const dynamic = "force-dynamic";
 export default async function QueuePage({
   searchParams,
 }: {
-  searchParams: Promise<{ retrying?: string }>;
+  searchParams: Promise<{
+    retrying?: string;
+    bulkUploaded?: string;
+    bulkDuplicates?: string;
+    bulkFailed?: string;
+  }>;
 }) {
-  const { retrying } = await searchParams;
+  const { retrying, bulkUploaded, bulkDuplicates, bulkFailed } = await searchParams;
   const supabase = getSupabaseAdmin();
 
   const { data: documents, error } = await supabase
@@ -102,6 +107,18 @@ export default async function QueuePage({
         <p className="mb-4 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-800">
           Retry started for document {retrying}. This page updates
           automatically once it finishes.
+        </p>
+      )}
+
+      {bulkUploaded !== undefined && (
+        <p className="mb-4 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-800">
+          Bulk upload: {bulkUploaded} document{bulkUploaded === "1" ? "" : "s"} ingested
+          and processing in the background
+          {Number(bulkDuplicates) > 0 &&
+            `, ${bulkDuplicates} duplicate${bulkDuplicates === "1" ? "" : "s"} skipped`}
+          {Number(bulkFailed) > 0 &&
+            `, ${bulkFailed} failed to ingest (see server logs)`}
+          . This page updates automatically.
         </p>
       )}
 
