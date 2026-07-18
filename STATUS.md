@@ -365,20 +365,58 @@ click approve. Repeat for every manual we use at work.
     triage → page files → chunking (NIM call itself simulated, not made —
     no credentials here) and confirmed the vision page was correctly routed
     and the resulting chunk correctly flagged `vision`.
-- [ ] **Needs to happen on your machine:**
-  1. `git pull`, reinstall (`pip install -e ".[dev]"` — no new deps), `pytest`
-     → should show 17 passed.
-  2. `NIM_VISION_MODEL` needs to actually be set in `.env` for this to do
-     anything real — check `corpus check`, fill it in if still blank.
-  3. Test with "the ugliest manual I've got" per the M3 brief: a scanned or
-     table-heavy PDF, via `corpus watch` or `ingest` + `process`. Watch the
-     `extract` step's timing — vision calls are sequential and can be slow,
-     that's expected (STATUS.md: "speed doesn't matter").
-  4. Eyeball `chunks.extraction_path` in Supabase — vision-derived chunks
-     should be flagged, and their `content` should look like sane markdown
-     transcription, not garbage or a refusal from the vision model.
-  5. Once that looks right, M3 is done; M4 (metadata inference + failure
-     handling/`corpus retry`) needs `NIM_LLM_MODEL` set.
+- [x] **M3 mechanics verified end-to-end against real Supabase/NIM.** Pulled,
+      reinstalled, `pytest` → 17/17. Set `NIM_VISION_MODEL=meta/llama-3.2-11b-vision-instruct`
+      (was blank; picked as a small/fast free-tier default — untested against
+      alternatives). Sanity-checked the model id with a direct
+      `vision_transcribe` call before running the pipeline (confirmed it
+      actually reads text out of an image). Built a synthetic 3-page test PDF
+      with one prose page, one no-text "scanned-looking" page (drawn shapes,
+      no real content), and one page with real extractable but grid-like
+      table text — then ran it through `ingest` + `process`.
+  - Triage routed correctly: page 1 stayed on the `text` path; page 2 (no
+    text layer) and page 3 (table-dense per the heuristic, even though
+    PyMuPDF *could* extract its text) both correctly went to vision.
+  - On page 3, the vision model actually reconstructed the zone/address grid
+    as a proper markdown table — genuinely better than PyMuPDF's raw
+    flattening of dense grid text. That part is a real win.
+  - **Found a real problem, not a synthetic-test artifact:** on page 3 the
+    vision model fell into a degenerate repetition loop — it re-emitted the
+    identical 20-row table **~30 times in a row** until hitting
+    `max_tokens=4096` in `providers.py::vision_transcribe`. `chunk.py` then
+    did exactly what it's designed to do with that input (correctly kept
+    each table instance atomic, packed them into chunks at the token limit)
+    — the chunker isn't the bug. The bug is that nothing between the vision
+    call and the DB insert detects or guards against a model repeating
+    itself, so this would silently write many near-duplicate chunks (wasted
+    embedding calls + budget, and duplicate/misleading results at retrieval
+    time) for any real page whose content is regular/grid-like enough to
+    trigger it — which is exactly the "Zone Configuration Table" style
+    content this pipeline exists to handle (see §3's own example table).
+  - On page 2 (the content-free drawn-shapes page), the vision model didn't
+    refuse or return anything obviously wrong — it hallucinated plausible-
+    sounding but fabricated "Fire Panel Manual" boilerplate. Expected for a
+    genuinely blank/content-free synthetic page and not directly testable
+    with real content, but worth remembering: there's currently no
+    hallucination check either, so a low-content real page (e.g. a mostly-
+    white page with a small logo) could produce confident-sounding nonsense
+    that goes straight into the corpus.
+  - Cleaned up the test document (Supabase row + `store/`/`work/` files)
+    afterward.
+- [ ] **Decision needed before M3 is actually safe to run on real manuals:**
+  how to guard against vision-model repetition loops — options include
+  detecting repeated N-line blocks in `vision_transcribe`'s output and
+  truncating, lowering `max_tokens` so a loop can't run as far, trying a
+  different/larger vision model less prone to this at `temperature=0`, or
+  accepting the risk for now and catching it manually in the review UI once
+  that exists (risky: review UI doesn't exist yet, and this burns real NIM
+  quota/embeddings before anyone looks at it). Not fixed yet — needs a call
+  on which approach, then implementation.
+- [ ] Once that's decided, run M3 again on "the ugliest manual I've got" (a
+      real scanned/table-heavy PDF, not synthetic) via `corpus watch` and
+      eyeball `chunks.extraction_path` + content quality in Supabase. Then
+      M4 (metadata inference + failure handling) can start, needs
+      `NIM_LLM_MODEL` set.
 
 ## 11. Session log
 
@@ -390,3 +428,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | M2 built on `main` (different session/sandbox than M1 — no `.env` here, so nothing was run against real Supabase/NIM). Implemented real `extract.py`/`chunk.py`/`embed.py`, added `corpus process`/wired `watch` to run the full pipeline, added `paths.py`. Unit-tested the chunker (7 passing tests) and smoke-tested PyMuPDF extraction against a synthetic PDF. | Run it for real: `git pull`, install, `pytest`, then feed it an actual manual via `corpus watch` and check the `chunks` table. Report back so M3 (vision path) can start. |
 | 2026-07-18 | Pulled M2 onto the laptop and ran it against real Supabase/NIM: `pytest` 7/7, then a synthetic 3-page PDF through `ingest` → `process` → verified `documents`/`chunks` rows in Supabase (table + procedure stayed intact in one chunk, embedding genuinely 1024 dims), then cleaned the test doc out. Mechanics confirmed working end-to-end. | Run the same flow against a real manual (not synthetic) to sign off M2 for real, then start M3 (vision path + triage) once `NIM_VISION_MODEL` is set. |
 | 2026-07-18 | M3 built on `main` (sandbox again has no `.env`). Added triage (`needs_vision`: thin-text-but-not-blank, or table-dense heuristics) and the vision extraction path to `extract.py`, a page-marker format so `chunk.py` knows which pages were vision-derived, and per-chunk `extraction_path` propagation. 10 new tests (17/17 total). Manually traced triage → page files → chunking against a synthetic mixed text/scanned PDF with the actual NIM call simulated (no credentials in this sandbox). | Run it for real: pull, install, `pytest` (17 passed expected), confirm `NIM_VISION_MODEL` is set, then feed it an actual scanned/table-heavy manual and check `chunks.extraction_path` + content quality in Supabase. Report back so M4 (metadata inference + failure handling) can start. |
+| 2026-07-18 | Pulled M3, `pytest` 17/17, set `NIM_VISION_MODEL=meta/llama-3.2-11b-vision-instruct` (was blank). Ran a synthetic mixed-content PDF (prose/scanned-looking/table-dense pages) through the real pipeline: triage routed all three pages correctly, and vision genuinely improved on a dense table PyMuPDF would've flattened. **Also found the vision model can fall into a degenerate repetition loop on grid-like content** — repeated a 20-row table ~30 times until hitting `max_tokens=4096`, which the chunker then dutifully packed into several near-duplicate chunks. Not a chunker bug; a missing safeguard between the vision call and the DB insert. Cleaned up the test document afterward. | Decide how to guard against vision repetition loops (detect+truncate, lower max_tokens, different model, or accept-and-catch-in-review-later) before trusting M3 on a real manual. Then test on an actual scanned/table-heavy PDF and start M4. |
