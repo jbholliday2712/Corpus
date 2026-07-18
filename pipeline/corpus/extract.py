@@ -13,10 +13,17 @@ from corpus import db
 from corpus.paths import STORE_DIR, WORK_DIR
 from corpus.providers import NIMClient
 
+NO_CONTENT_SENTINEL = "NO_CONTENT"
+
 VISION_PROMPT = (
     "Transcribe this fire panel manual page to clean markdown. "
     "Preserve tables as markdown tables. Preserve numbered steps. "
-    "Do not summarise or omit anything."
+    "Do not summarise or omit anything. If the page has no manual content "
+    "to transcribe (for example: a blank page, a cover page, or a page "
+    "showing only a logo, branding, or compliance marks with no "
+    f"instructional text), respond with exactly the single word: "
+    f"{NO_CONTENT_SENTINEL}. Never invent content that is not visibly on "
+    "the page."
 )
 
 # ~150 DPI (PyMuPDF's default page space is 72 DPI).
@@ -27,6 +34,18 @@ _TABLE_DENSE_MIN_LINES = 12
 _TABLE_DENSE_SHORT_LINE_RATIO = 0.65
 _TABLE_DENSE_SHORT_LINE_CHARS = 20
 _BLANK_NONWHITE_FRACTION = 0.002
+
+_FLAT_GRAPHIC_MATRIX = pymupdf.Matrix(0.3, 0.3)  # same scale as the blank check
+_FLAT_GRAPHIC_GRID = 10  # page divided into a 10x10 grid of cells
+_FLAT_GRAPHIC_CELL_STD_THRESHOLD = 12  # a cell counts as "textured" above this
+_FLAT_GRAPHIC_MIN_TEXTURED_ROW_FRACTION = 0.3  # below this, the page reads as
+# a handful of flat color blocks (a cover/logo/branding page) rather than
+# real content. Deliberately measured as *row coverage*, not overall cell
+# fraction: a single shape's edge (e.g. a solid color rectangle's border)
+# lights up a thin ring of high-variance cells that can be a big chunk of
+# total cells without the page having any real content — real running text
+# or diagrams instead vary across most of the page's vertical extent, so a
+# row is only "textured" once and rows are counted, not individual cells.
 
 _PAGE_MARKER_RE = re.compile(r"^<!-- path: (text|vision) -->\n")
 
@@ -62,9 +81,67 @@ def _page_is_blank(page) -> bool:
     return (nonwhite / len(samples)) < _BLANK_NONWHITE_FRACTION
 
 
+def _is_flat_graphic(page) -> bool:
+    """True when the rendered page is dominated by a few large uniform-color
+    regions (e.g. a cover with solid color blocks and a small logo) rather
+    than genuinely dense visual content (real scanned text or diagrams).
+    Vision-language models will confidently fabricate plausible-sounding
+    manual content for a page that has nothing real to transcribe — asking
+    the model to say "nothing here" isn't reliable (see VISION_PROMPT's
+    NO_CONTENT_SENTINEL, which this heuristic exists because that alone
+    wasn't enough), so pages like this are kept off the vision path
+    entirely rather than trusting the model to decline."""
+    pix = page.get_pixmap(matrix=_FLAT_GRAPHIC_MATRIX, colorspace=pymupdf.csGRAY)
+    samples = pix.samples
+    width, height, stride = pix.width, pix.height, pix.stride
+    if not samples or width < _FLAT_GRAPHIC_GRID or height < _FLAT_GRAPHIC_GRID:
+        return False
+
+    cell_w = width // _FLAT_GRAPHIC_GRID
+    cell_h = height // _FLAT_GRAPHIC_GRID
+    textured_rows = 0
+    total_rows = 0
+    for gy in range(_FLAT_GRAPHIC_GRID):
+        y0, y1 = gy * cell_h, min((gy + 1) * cell_h, height)
+        if y0 >= y1:
+            continue
+        total_rows += 1
+        row_has_texture = False
+        for gx in range(_FLAT_GRAPHIC_GRID):
+            x0, x1 = gx * cell_w, min((gx + 1) * cell_w, width)
+            values = [
+                samples[y * stride + x]
+                for y in range(y0, y1)
+                for x in range(x0, x1)
+            ]
+            if not values:
+                continue
+            mean = sum(values) / len(values)
+            variance = sum((v - mean) ** 2 for v in values) / len(values)
+            if variance**0.5 > _FLAT_GRAPHIC_CELL_STD_THRESHOLD:
+                row_has_texture = True
+                break
+        if row_has_texture:
+            textured_rows += 1
+
+    if total_rows == 0:
+        return False
+    return (textured_rows / total_rows) < _FLAT_GRAPHIC_MIN_TEXTURED_ROW_FRACTION
+
+
+def _vision_content_or_empty(raw: str) -> str:
+    """The model is asked to respond with NO_CONTENT_SENTINEL for a page
+    with nothing to transcribe; turn that into empty page content so
+    chunk.py's blank-paragraph handling naturally produces no chunk for it,
+    instead of writing whatever the model said verbatim."""
+    return "" if raw.strip() == NO_CONTENT_SENTINEL else raw
+
+
 def needs_vision(page, text: str) -> bool:
     stripped = text.strip()
-    if len(stripped) < _MIN_TEXT_CHARS and not _page_is_blank(page):
+    if len(stripped) < _MIN_TEXT_CHARS:
+        if _page_is_blank(page) or _is_flat_graphic(page):
+            return False
         return True
     return _is_table_dense(text)
 
@@ -105,7 +182,7 @@ def extract_document(document_id: str) -> int:
                     client = NIMClient()
                 png_bytes = page.get_pixmap(matrix=_VISION_MATRIX).tobytes("png")
                 content = client.vision_transcribe(png_bytes, VISION_PROMPT)
-                write_page(out_path, "vision", content)
+                write_page(out_path, "vision", _vision_content_or_empty(content))
             else:
                 write_page(out_path, "text", text)
     finally:

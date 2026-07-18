@@ -104,3 +104,15 @@ def test_extraction_path_defaults_to_text_when_omitted():
     pages = [{"page": 1, "text": "No extraction_path key supplied."}]
     chunks = chunk_pages(pages)
     assert chunks[0]["extraction_path"] == "text"
+
+
+def test_empty_page_contributes_no_chunks():
+    """A page extract.py flagged as NO_CONTENT (blank/cover/logo-only) is
+    written with empty content; it must not turn into a fabricated chunk."""
+    pages = [
+        {"page": 1, "text": "Real content on this page.", "extraction_path": "text"},
+        {"page": 2, "text": "", "extraction_path": "vision"},
+    ]
+    chunks = chunk_pages(pages)
+    assert len(chunks) == 1
+    assert chunks[0]["page_end"] == 1

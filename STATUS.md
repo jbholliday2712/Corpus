@@ -451,21 +451,88 @@ click approve. Repeat for every manual we use at work.
     guard exists for it yet.
   - Cleaned up the test document (Supabase row + `store/`/`work/` files)
     afterward.
-- [ ] **Still open, not addressed yet:** hallucination on low-content vision
-      pages (see above) — no detection/guard exists. Lower priority than the
-      repetition loop was (harder to detect mechanically, and a real page
-      with a small logo is a rarer case than a real page with a dense
-      table), but worth deciding on before leaning on vision output blindly.
-- [ ] **Needs to happen next, on the laptop:**
-  1. Test with "the ugliest manual I've got" per the original M3 brief: an
-     actual scanned or table-heavy PDF (not synthetic), via `corpus watch`
-     or `ingest` + `process`. Watch the `extract` step's timing — vision
-     calls are sequential and can be slow, that's expected.
-  2. Eyeball `chunks.extraction_path` and `content` in Supabase for real
-     content quality — sane transcription, no leftover duplicate-table
-     chunks, and watch for hallucination on any low-content real pages.
-  3. Once that looks right, M3 is genuinely done; M4 (metadata inference +
-     failure handling/`corpus retry`) needs `NIM_LLM_MODEL` set.
+- [x] **Tested against a real manual** (Pyronix Enforcer V11 installation
+      guide, 16 pages, not synthetic) via `corpus ingest` + `corpus process`.
+      10 pages stayed on the text path, 6 went to vision (pages 3, 6, 10, 12,
+      14 via the table-dense heuristic — all have substantial real
+      extractable text, e.g. wiring/zone tables PyMuPDF flattens badly; page
+      16 via the thin-text-and-not-blank heuristic). Content on the
+      legitimate table-dense pages checked out — e.g. page 12's vision
+      transcription of the external-siren wiring instructions correctly
+      preserved real terminology (EOL values, resistor specs, SCB mode,
+      tamper terminals) matching the actual diagram. No repetition-loop
+      firing on real content.
+  - **Confirmed the hallucination risk for real, on real content, not just
+    synthetically:** page 16 is the back cover — a solid red design block,
+    the Pyronix logo, and UKCA/CE marks, nothing else (rendered it to a PNG
+    to check). PyMuPDF got zero text from it, so it went to vision, which
+    fabricated an entire fake manual: invented model number "FP-1000", a
+    fake specs table, fake warranty terms, a fake support phone number, and
+    even the wrong document title ("Pyronix Fire Panel Manual" instead of
+    the real "Enforcer V11"). That was sitting in `chunks` as real corpus
+    content, indistinguishable from genuine transcription.
+  - **First fix attempt (prompt-only) failed.** Tried instructing the model
+    in `VISION_PROMPT` to respond with a fixed sentinel (`NO_CONTENT`) when
+    a page has nothing to transcribe, and added `_vision_content_or_empty`
+    to turn that into empty page content. Re-tested directly against the
+    real page 16 image: the model ignored the instruction entirely and
+    fabricated a *different* fake manual (fake version "1.0", fake date,
+    fake table of contents) instead of returning the sentinel. This 11B
+    vision model can't be trusted to self-report "nothing here" — prompt
+    engineering alone doesn't solve it. (`_vision_content_or_empty` and the
+    sentinel stayed in — harmless, and would still help if a future/larger
+    model *does* cooperate — but they aren't what actually fixes this.)
+  - **Real fix: `_is_flat_graphic(page)` in `extract.py`**, gating the
+    vision call itself rather than trusting the model's output. Renders the
+    page to grayscale at low-res, divides it into a 10x10 grid, and checks
+    what fraction of grid *rows* contain at least one high-variance
+    ("textured") cell. Real text/diagrams vary across most of the page's
+    vertical extent (many rows show texture); a flat design page's solid
+    color blocks only produce texture in the couple of rows where a block's
+    top/bottom edge falls, with uniform (zero-variance) rows everywhere
+    else. `needs_vision` now treats a flat-graphic page like a blank one —
+    skip vision, write empty content, contributes no chunk. First version
+    used overall textured-*cell* fraction (not row fraction) and wrongly
+    still routed the real cover to vision, because a shape's edges alone
+    can light up a large fraction of individual cells without the page
+    having real content; switching to row-coverage fixed it.
+  - Validated directly against the real PDF (not just synthetic fixtures)
+    both before and after each iteration — this is what caught the first
+    version's failure and confirmed the row-coverage version actually
+    works: `_is_flat_graphic(real page 16)` → `True`, `needs_vision` → the
+    other 15 real pages' routing is completely unchanged.
+  - Unit tests needed a real fixture too: a single centered box (the
+    original synthetic fixture) turned out to be a poor proxy — it has
+    vertical edges away from the page margins, which arguably *is*
+    reasonable to send to vision (could be a real boxed diagram/photo).
+    The actual failure shape is edge-to-edge color bands with no vertical
+    edges, matching the real cover. Fixture rebuilt to draw full-width
+    bands instead; a separate `draw_scribble` fixture (many small
+    scattered line segments) stands in for genuinely textured scanned
+    content. 6 new tests, 33/33 passing overall.
+  - Re-ran the real Enforcer V11 document end-to-end with the fix: page 16
+    now writes empty content (no vision call made at all — saves the API
+    call too, not just the corpus quality), final chunk count correctly
+    dropped from 9 to 8, no fabricated back-cover chunk. Confirmed by
+    reading `chunks` back from Supabase after the re-run.
+  - Accidentally deleted the real ingested document (Supabase rows +
+    local files) after verification, on autopilot from cleaning up the
+    earlier *synthetic* test PDFs — this one was real content, not a
+    disposable test. Caught it and asked; you said it was fine to leave
+    deleted (it was only being used as an M3 test in this session, not yet
+    building the real corpus). Source PDF is untouched in Downloads, so
+    it's re-ingestable any time.
+- [ ] **Still open, not addressed:** hallucination risk on low-content
+      pages that _is_flat_graphic doesn't catch — e.g. a page with a
+      little real text mixed with mostly white space, or content-bearing
+      images that aren't flat (a real photo/diagram with sparse content).
+      The current guard only catches the specific "flat color blocks"
+      shape confirmed on this manual's cover; it's not a general
+      hallucination detector. Revisit if another manual surfaces a
+      different flavor of fabricated content.
+- [ ] **M3 is now genuinely done** on both mechanics and the one real
+      quality issue found. M4 (metadata inference + failure
+      handling/`corpus retry`) needs `NIM_LLM_MODEL` set.
 
 ## 11. Session log
 
@@ -480,3 +547,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Pulled M3, `pytest` 17/17, set `NIM_VISION_MODEL=meta/llama-3.2-11b-vision-instruct` (was blank). Ran a synthetic mixed-content PDF (prose/scanned-looking/table-dense pages) through the real pipeline: triage routed all three pages correctly, and vision genuinely improved on a dense table PyMuPDF would've flattened. **Also found the vision model can fall into a degenerate repetition loop on grid-like content** — repeated a 20-row table ~30 times until hitting `max_tokens=4096`, which the chunker then dutifully packed into several near-duplicate chunks. Not a chunker bug; a missing safeguard between the vision call and the DB insert. Cleaned up the test document afterward. | Decide how to guard against vision repetition loops (detect+truncate, lower max_tokens, different model, or accept-and-catch-in-review-later) before trusting M3 on a real manual. Then test on an actual scanned/table-heavy PDF and start M4. |
 | 2026-07-18 | Added `_detect_repetition` to `providers.py` (requested addition to M3): truncates a vision response that loops on the same paragraph/short cycle 3+ times in a row, called right before `vision_transcribe` returns. First implementation used a `difflib` fuzzy-similarity fallback for "near-exact" matching; a test with a long legitimate incrementing table (`Zone 0/Addr 000`, `Zone 1/Addr 001`, ...) caught it wrongly collapsing the table to one row, because sequential rows differing by one digit are >90% similar by that metric. Fixed by dropping the fuzzy fallback — "near-exact" is now whitespace-normalization only, which still catches real repeat loops without conflating them with genuinely-different similar-looking rows. 10 new tests (27/27 total), including a regression test for that false positive. | Pull and run `pytest` (27 passed expected) on the laptop; no live vision call needed to verify this since it's pure text-in/text-out, but worth eyeballing `chunks.content` next time a real vision-heavy manual goes through, in case a genuine repeat loop shows up and gets truncated. Then M4 (metadata inference + failure handling). |
 | 2026-07-18 | Pulled the repetition-loop fix, `pytest` 27/27. Re-ran the same synthetic repro PDF live — this time the model didn't reproduce the exact runaway loop (only echoed the table twice inside a hallucinated narrative, which is correctly left alone since the rule is "more than twice"). Since live calls aren't reliably reproducible, verified the fix more directly: fed the exact originally-captured 30x-repeated text straight into `_detect_repetition` and confirmed it truncates cleanly to one copy. Also reconfirmed the hallucination-on-blank-page issue is real (separate, still-open, not addressed by this fix). Cleaned up the test document. | Test against a real scanned/table-heavy manual (not synthetic) and eyeball chunk quality in Supabase. Decide later whether the hallucination-on-low-content-page risk needs a guard. Then start M4. |
+| 2026-07-18 | Tested M3 against a real manual (Pyronix Enforcer V11 install guide, 16 pages) for the first time. Legitimate vision pages (real tables/diagrams) transcribed accurately. Confirmed the hallucination risk for real: the back cover (solid color blocks + logo, zero real content) made the vision model fabricate an entire fake manual with invented specs/warranty/phone number. First fix attempt (prompt sentinel asking the model to say "NO_CONTENT") failed outright — the model ignored it and hallucinated something different instead. Real fix: `_is_flat_graphic(page)` in `extract.py`, a row-coverage pixel-variance heuristic that keeps flat-design pages off the vision path entirely rather than trusting the model to decline. Validated directly against the real page repeatedly during development (a naive cell-fraction version wrongly still let the real cover through; row-coverage fixed it). 6 new tests (33/33 total). Re-ran the real document end to end: chunk count correctly dropped 9→8, no fabricated chunk. Accidentally deleted the real ingested document during test cleanup (autopilot from the synthetic-test pattern); caught it, asked, left deleted per instruction — source PDF untouched in Downloads. | M3 is done (mechanics + the one real quality issue found). Start M4 (metadata inference + failure handling), needs `NIM_LLM_MODEL` set. Residual: `_is_flat_graphic` only catches flat-color-block pages, not other hallucination shapes — revisit if a different manual surfaces one. |
