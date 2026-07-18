@@ -530,9 +530,78 @@ click approve. Repeat for every manual we use at work.
       shape confirmed on this manual's cover; it's not a general
       hallucination detector. Revisit if another manual surfaces a
       different flavor of fabricated content.
-- [ ] **M3 is now genuinely done** on both mechanics and the one real
-      quality issue found. M4 (metadata inference + failure
-      handling/`corpus retry`) needs `NIM_LLM_MODEL` set.
+- [x] **M3 is now genuinely done** on both mechanics and the one real
+      quality issue found.
+- [x] M4 code written (same sandbox/no-`.env` constraint as every build
+      session — logic verified with monkeypatched DB/NIM, not yet run
+      against real Supabase/NIM):
+  - `metadata.py`: `infer_metadata(document_id)` sends the first 3 extracted
+    pages to `NIMClient.llm_complete` with the exact prompt from STATUS.md
+    §4 Stage 2, asking for JSON `{manufacturer, panel_model, doc_type,
+    revision}`. `_parse_metadata_response` (pure, unit-tested) tolerates a
+    markdown code fence and prose around the JSON object, and coerces an
+    out-of-enum `doc_type` to `'other'` rather than raising — NOT PICKY, and
+    a human confirms metadata in the review UI anyway (`metadata_confirmed`
+    stays `false`, unchanged from the M1 schema default). Resumable: if the
+    document row already has a `doc_type`, returns the stored values instead
+    of re-spending an LLM call.
+  - Wired into `_process` in `cli.py` (extract → **metadata** → chunk →
+    embed) as **best-effort** — a metadata failure (bad/missing
+    `NIM_LLM_MODEL`, malformed LLM response) is logged and skipped, not
+    fatal to the document. Rationale: metadata is a human-reviewed
+    enrichment layered on top of the core content pipeline, not a
+    prerequisite for it — a manual should still get its chunks/embeddings
+    into the corpus even if metadata inference has a bad day.
+  - **Fixed a real resumability gap while building `corpus retry`:**
+    `chunk_document` previously re-inserted a full fresh chunk set on every
+    call with no check for existing rows. That's fine standalone, but it
+    would have broken `embed_document`'s own resumability on retry — if
+    chunking had already succeeded and embedding was partway through when a
+    later batch failed, retrying the pipeline would re-chunk (deleting nothing
+    but inserting *duplicate* rows) or at minimum orphan the
+    already-embedded rows' meaning from the fresh set. Fixed: `chunk_document`
+    now checks `db.count_chunks(document_id)` first and skips straight to
+    `status=chunking` if chunks already exist, exactly mirroring how
+    `extract` skips already-written pages and `embed` skips
+    already-embedded chunks. `db.count_chunks` added.
+  - `corpus retry <document_id>` now actually works — it's the same
+    `_process` (extract → metadata → chunk → embed) as `process`/`watch`,
+    which is the point: every stage is independently resumable (checks its
+    own DB/filesystem state), so re-running the whole pipeline on a
+    previously-`failed` document is safe and cheap — it only redoes the
+    stage(s) that didn't finish, never repeats NIM calls (vision, LLM,
+    embed) for work that already succeeded. `_process` also now clears
+    `error_message` on a fully successful run so stale error text doesn't
+    linger after a fix.
+  - `watch`'s per-document try/except (one bad PDF doesn't kill the loop)
+    was already in place from M2/M3 — confirmed still intact, no changes
+    needed there for M4's "failure handling" requirement.
+  - New tests: `tests/test_metadata.py` (8 tests — plain JSON, code-fence-
+    wrapped JSON, prose around the JSON, unrecognized/missing `doc_type`
+    coerced to `'other'`, missing/empty fields become `None`, unparseable
+    response raises). 41/41 passing pipeline-wide.
+  - Manually verified (monkeypatched `corpus.db`/`corpus.providers`, no real
+    network) that: (1) `infer_metadata` calls the LLM exactly once across
+    two calls when the second call finds `doc_type` already set, and (2)
+    `chunk_document` does not call `insert_chunks` again when chunks already
+    exist for the document, returning the existing count instead.
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`, reinstall (`pip install -e ".[dev]"` — no new deps), `pytest`
+     → should show 41 passed.
+  2. `NIM_LLM_MODEL` needs to actually be set in `.env` — check `corpus
+     check`, fill it in if still blank (it was blank as of the M3 session).
+  3. Test metadata inference against a real manual: `ingest` + `process` (or
+     `watch`), then check the `documents` row in Supabase —
+     manufacturer/panel_model/doc_type/revision should be populated and
+     sane, `metadata_confirmed` still `false`.
+  4. Test `corpus retry` for real: pick a document, manually null out its
+     `embedding` on one chunk (or find/force a genuine failure — e.g. break
+     `NIM_API_KEY` temporarily mid-embed), confirm status goes to `failed`,
+     then `corpus retry <id>` and confirm it resumes cleanly — watch the
+     log output for "metadata inference skipped"/stage-skip behavior if
+     applicable, and confirm no duplicate chunks or wasted re-embeds happen.
+  5. Once that looks right, M4 is done. M5 (review UI) is next — no NIM
+     model needed for that, just Next.js talking to the same Supabase.
 
 ## 11. Session log
 
@@ -548,3 +617,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Added `_detect_repetition` to `providers.py` (requested addition to M3): truncates a vision response that loops on the same paragraph/short cycle 3+ times in a row, called right before `vision_transcribe` returns. First implementation used a `difflib` fuzzy-similarity fallback for "near-exact" matching; a test with a long legitimate incrementing table (`Zone 0/Addr 000`, `Zone 1/Addr 001`, ...) caught it wrongly collapsing the table to one row, because sequential rows differing by one digit are >90% similar by that metric. Fixed by dropping the fuzzy fallback — "near-exact" is now whitespace-normalization only, which still catches real repeat loops without conflating them with genuinely-different similar-looking rows. 10 new tests (27/27 total), including a regression test for that false positive. | Pull and run `pytest` (27 passed expected) on the laptop; no live vision call needed to verify this since it's pure text-in/text-out, but worth eyeballing `chunks.content` next time a real vision-heavy manual goes through, in case a genuine repeat loop shows up and gets truncated. Then M4 (metadata inference + failure handling). |
 | 2026-07-18 | Pulled the repetition-loop fix, `pytest` 27/27. Re-ran the same synthetic repro PDF live — this time the model didn't reproduce the exact runaway loop (only echoed the table twice inside a hallucinated narrative, which is correctly left alone since the rule is "more than twice"). Since live calls aren't reliably reproducible, verified the fix more directly: fed the exact originally-captured 30x-repeated text straight into `_detect_repetition` and confirmed it truncates cleanly to one copy. Also reconfirmed the hallucination-on-blank-page issue is real (separate, still-open, not addressed by this fix). Cleaned up the test document. | Test against a real scanned/table-heavy manual (not synthetic) and eyeball chunk quality in Supabase. Decide later whether the hallucination-on-low-content-page risk needs a guard. Then start M4. |
 | 2026-07-18 | Tested M3 against a real manual (Pyronix Enforcer V11 install guide, 16 pages) for the first time. Legitimate vision pages (real tables/diagrams) transcribed accurately. Confirmed the hallucination risk for real: the back cover (solid color blocks + logo, zero real content) made the vision model fabricate an entire fake manual with invented specs/warranty/phone number. First fix attempt (prompt sentinel asking the model to say "NO_CONTENT") failed outright — the model ignored it and hallucinated something different instead. Real fix: `_is_flat_graphic(page)` in `extract.py`, a row-coverage pixel-variance heuristic that keeps flat-design pages off the vision path entirely rather than trusting the model to decline. Validated directly against the real page repeatedly during development (a naive cell-fraction version wrongly still let the real cover through; row-coverage fixed it). 6 new tests (33/33 total). Re-ran the real document end to end: chunk count correctly dropped 9→8, no fabricated chunk. Accidentally deleted the real ingested document during test cleanup (autopilot from the synthetic-test pattern); caught it, asked, left deleted per instruction — source PDF untouched in Downloads. | M3 is done (mechanics + the one real quality issue found). Start M4 (metadata inference + failure handling), needs `NIM_LLM_MODEL` set. Residual: `_is_flat_graphic` only catches flat-color-block pages, not other hallucination shapes — revisit if a different manual surfaces one. |
+| 2026-07-18 | M4 built on `main` (sandbox again has no `.env`). Added `metadata.py` (LLM metadata inference, resumable, wired into `_process` as best-effort/non-fatal). Implemented `corpus retry` for real — found and fixed a resumability gap along the way: `chunk_document` was re-inserting a duplicate chunk set on every call, which would have defeated `embed_document`'s resumability (and wasted NIM quota) on a retry-after-embed-failure; fixed with a `db.count_chunks` existence check, mirroring how extract/embed already skip completed work. 8 new tests (41/41 total); also manually verified (monkeypatched DB/NIM) that both `infer_metadata` and `chunk_document` correctly skip redoing work on a second call. | Pull, install, `pytest` (41 passed expected), set `NIM_LLM_MODEL`, then run metadata inference against a real manual and check the `documents` row. Test `corpus retry` against a real induced failure to confirm it resumes cleanly without wasting NIM calls. Then M5 (review UI). |

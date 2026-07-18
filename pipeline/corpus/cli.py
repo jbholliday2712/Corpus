@@ -5,24 +5,37 @@ from pathlib import Path
 
 import click
 
-from corpus import chunk, db, embed, extract, intake
+from corpus import chunk, db, embed, extract, intake, metadata
 from corpus.config import load_settings
 from corpus.paths import INBOX_DIR
 from corpus.providers import NIMClient
 
 
 def _process(document_id: str) -> None:
-    """Run extract -> chunk -> embed for one document. On any failure, mark
-    the document `failed` with the error message and re-raise so the caller
-    decides whether to keep going (matches STATUS.md's failure handling: one
-    bad PDF must not kill a `watch` loop processing others)."""
+    """Run extract -> metadata -> chunk -> embed for one document. Every
+    stage is resumable (extract/chunk/embed/metadata each skip work already
+    done), so this is also what `corpus retry` calls — re-running it on a
+    document that got partway through just picks up where it left off.
+    Metadata inference is best-effort: it's a human-reviewed enrichment, not
+    part of the core content pipeline, so a bad/missing NIM_LLM_MODEL or a
+    malformed LLM response is logged and skipped rather than failing the
+    whole document. On any other failure, mark the document `failed` with
+    the error message and re-raise so the caller decides whether to keep
+    going (matches STATUS.md's failure handling: one bad PDF must not kill a
+    `watch` loop processing others)."""
     try:
         pages = extract.extract_document(document_id)
         click.echo(f"  extracted {pages} pages")
+        try:
+            meta = metadata.infer_metadata(document_id)
+            click.echo(f"  inferred metadata: {meta}")
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  metadata inference skipped: {exc}")
         n_chunks = chunk.chunk_document(document_id)
         click.echo(f"  chunked into {n_chunks} chunks")
         n_embedded = embed.embed_document(document_id)
         click.echo(f"  embedded {n_embedded} chunks -> status=review")
+        db.update_document(document_id, {"error_message": None})
     except Exception as exc:  # noqa: BLE001
         db.update_document(document_id, {"status": "failed", "error_message": str(exc)})
         raise
@@ -85,7 +98,7 @@ def ingest(path: Path):
 @main.command()
 @click.argument("document_id")
 def process(document_id: str):
-    """Run extract -> chunk -> embed for a document (text-path happy path)."""
+    """Run extract -> metadata -> chunk -> embed for a document."""
     try:
         _process(document_id)
     except Exception as exc:  # noqa: BLE001
@@ -97,8 +110,8 @@ def process(document_id: str):
 @click.option("--interval", default=5, help="Seconds between inbox scans.")
 def watch(inbox: Path, interval: int):
     """Watch ./inbox/, ingest any PDF dropped there, and run the full
-    extract -> chunk -> embed pipeline on it. One bad PDF is logged and
-    skipped; the loop keeps going."""
+    extract -> metadata -> chunk -> embed pipeline on it. One bad PDF is
+    logged and skipped; the loop keeps going."""
     inbox.mkdir(parents=True, exist_ok=True)
     click.echo(f"Watching {inbox} (Ctrl+C to stop)...")
     seen: set[str] = set()
@@ -125,8 +138,19 @@ def watch(inbox: Path, interval: int):
 @main.command()
 @click.argument("document_id")
 def retry(document_id: str):
-    """Re-run a failed document from its last good stage. (lands with M4 status machine)"""
-    raise click.ClickException("retry lands in M4 once the status machine is built")
+    """Re-run a document from its last completed stage. Extract skips pages
+    already written, metadata skips if already inferred, chunk skips if
+    chunks already exist, embed only fills in missing embeddings — so this
+    is safe to run on a `failed` document without redoing NIM calls (or
+    burning quota) for work that already succeeded before the failure."""
+    doc_row = db.get_document(document_id)
+    if doc_row is None:
+        raise click.ClickException(f"no document {document_id}")
+    try:
+        _process(document_id)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"Retry failed: {exc}")
+    click.echo(f"Retried {document_id} -> status=review")
 
 
 @main.command(name="status")

@@ -206,6 +206,15 @@ def chunk_document(document_id: str) -> int:
     if doc_row is None:
         raise ValueError(f"no document {document_id}")
 
+    # Resumable like extract/embed: if chunking already succeeded on a
+    # previous run (e.g. this document is being retried after embed failed),
+    # skip straight to done rather than re-inserting a duplicate chunk set —
+    # that would also orphan any embeddings already written for the old rows.
+    existing = db.count_chunks(document_id)
+    if existing:
+        db.update_document(document_id, {"status": "chunking"})
+        return existing
+
     pages_dir = WORK_DIR / doc_row["file_hash"] / "pages"
     page_paths = sorted(pages_dir.glob("*.md"))
     if not page_paths:

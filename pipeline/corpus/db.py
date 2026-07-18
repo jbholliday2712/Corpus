@@ -61,6 +61,17 @@ def insert_chunks(rows: list[dict]) -> list[dict]:
     return res.data
 
 
+def count_chunks(document_id: str) -> int:
+    client = get_client()
+    res = (
+        client.table("chunks")
+        .select("id", count="exact")
+        .eq("document_id", document_id)
+        .execute()
+    )
+    return res.count or 0
+
+
 def get_chunks_missing_embedding(document_id: str) -> list[dict]:
     client = get_client()
     res = (
