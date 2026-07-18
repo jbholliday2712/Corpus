@@ -805,31 +805,67 @@ click approve. Repeat for every manual we use at work.
     Next-bundled-postcss vulnerabilities, nothing new.
   - **Not verified:** the actual click/search/cluster interactions in a
     real browser against real embeddings — needs your machine.
+- [x] **Real bug found and fixed:** first live use on the laptop (M6 has
+      started — real files going in now) surfaced that search was actually
+      broken: `Error: No such option '--json'`. Root cause —
+      `app/actions.ts`'s `searchChunks` called
+      `corpus embed-query <text> --json`, but `embed-query` (unlike
+      `ingest`) never had a `--json` flag defined; it always prints JSON
+      unconditionally, so the flag was simply invalid. Reproduced the exact
+      reported error with `CliRunner` before touching anything, fixed by
+      dropping the erroneous `--json` arg from the TS call, then verified
+      the corrected invocation against a monkeypatched `NIMClient`. This
+      shipped broken because the CLI test coverage for `embed-query`
+      (added last round) only tested the Python side in isolation and
+      never exercised the exact argv `review-ui` actually sends —
+      worth remembering for future CLI-from-Node integration points.
+- [x] **Automatic flagging, to answer "how do I verify documents without
+      reading every one":** `lib/flags.ts` — cheap heuristics computed from
+      data already in the DB (no new NIM calls), explicitly documented as
+      triage aids, not a correctness guarantee:
+  - Zero chunks despite pages processed and `status` = review/done
+    (critical — extraction likely produced nothing).
+  - Low average tokens/page (extraction may have missed most content).
+  - Chunks under 15 tokens (near-empty extraction).
+  - >50% of a document's chunks vision-derived (higher hallucination/
+    repetition risk per M3).
+  - `manufacturer`/`revision` field "looks like an explanation, not a
+    value" (length >40 chars or contains `(`) — targets the *exact*,
+    already-observed M4 prose-in-metadata bug, not prose in general;
+    verified this specific case gets flagged before wiring it in.
+  - Missing `doc_type` after processing.
+  - Surfaced as a **Flags** column + a "Flagged only" filter checkbox on
+    the queue view (`DocumentTable.tsx`, now a client component so the
+    filter doesn't need a server round-trip), and as a summary box plus
+    individual `⚠ short chunk` highlighting on the document page — so a
+    flagged document's problem chunk is visually obvious without reading
+    every chunk to find it.
+  - Verified `computeDocumentFlags`/`isChunkFlagged` standalone against 5
+    hand-built scenarios (healthy doc → no flags; the real M4 prose case →
+    correctly flagged; zero-chunks → critical; 70%-vision doc → flagged;
+    a still-processing document → correctly *not* flagged yet) before
+    wiring into React.
+  - `tsc --noEmit` clean, `next build` succeeds across all four routes,
+    `next dev` still serves them with the expected clean error.
 - [ ] **Needs to happen on your machine:**
-  1. `git pull`. `cd review-ui && npm install`. Apply both new migrations
-     (`chunk_similarity_edges` from last round if not already applied, and
-     the new `search_chunks`) the same way the initial schema was applied.
-  2. `npm run dev`, open `http://localhost:3000`.
-  3. **Upload + Graph basics:** confirm from last round still work (upload
-     starts processing; graph nodes render/color/link correctly, clicking
-     highlights the right chunk on the document page via the "Open in
-     document" link).
-  4. **Preview panel:** click a node on `/graph` — confirm the side panel
-     opens with real content (not stuck on "Loading…"), shows sane
-     neighbours with sensible similarity percentages, and that clicking a
-     neighbour re-selects it in place.
-  5. **Search:** type something you know is in a loaded manual (e.g. a
-     section heading or a distinctive phrase), confirm matching nodes
-     highlight and the match count looks plausible — this is the first
-     real test of whether the embedding search is actually useful,
-     independent of the graph.
-  6. **Clustering:** toggle "Color: cluster" once there's more than one
-     document loaded, eyeball whether same-colored chunks across different
-     manuals actually read as related content to a human, or if it's noise
-     — this is exactly the "is it actually smart" question from earlier,
-     now testable with real data.
-  7. Once that's confirmed, this follow-up round is done. M6 is loading the
-     rest of the real 5-panel corpus — no more code needed for that.
+  1. `git pull`. `npm install` isn't needed (no new dependency). Apply the
+     `search_chunks` migration if you haven't already (from right before
+     the bug report).
+  2. `npm run dev`, retry the search that failed — should actually return
+     highlighted matches now.
+  3. **Search:** type something you know is in a loaded manual, confirm
+     matches highlight and look plausible.
+  4. **Flags:** open the queue view, check the new Flags column and
+     "Flagged only" toggle. As real manuals go in via M6, this is now the
+     actual answer to "verify without reading everything" — open only
+     what's flagged, spot-check a couple of unflagged ones occasionally to
+     calibrate trust in the heuristics, don't feel obligated to open every
+     document.
+  5. **Preview panel + clustering:** still worth checking now that search
+     works (clicking a node, cluster coloring) — see prior entry for what
+     to look for.
+  6. Once confirmed, keep loading the real corpus (M6) — flag anything
+     that still trips you up.
 
 ## 11. Session log
 
@@ -850,3 +886,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | M5 built on `main` (sandbox again has no real Supabase): `review-ui/`, a minimal Next.js 16 App Router + TypeScript + Tailwind v4 app with the queue view and document view from STATUS.md §5. Queue view's metadata fields are plain editable inputs (not read-only) specifically because of the prose-in-manufacturer/revision finding from the last session — review here means "look and fix," which is the mitigation for that still-open decision. Retry button shells out to `python -m corpus.cli retry <id>` as a detached background process rather than reimplementing retry logic in JS. Hit and root-caused a real build break: `npm install` resolved `typescript` to `7.0.2`, which crashed Next's internal type-check with an opaque low-level Node error; pinned to `^5.9.3` (what Next 16.2.10 actually expects) after confirming via `ignoreBuildErrors` that the crash was specifically in the TS step. `next build` (Turbopack, the default) succeeds cleanly; noted but didn't chase a separate `--webpack` path-alias resolution failure since Turbopack is what this app actually uses. `next dev` boots and both routes correctly fail with a clean "SUPABASE_URL / SUPABASE_SERVICE_KEY are not set" 500 rather than crashing, since no real Supabase is reachable from here. | Pull, `npm install`, set up `review-ui/.env.local` from the example (same Supabase creds as `pipeline/.env`, plus CORPUS_PYTHON/CORPUS_PIPELINE_DIR for Retry), `npm run dev`, and actually use it in a browser against real data: open a document, check chunk rendering, edit/confirm metadata, approve a review-status doc, retry a failed one if any exist, delete a disposable test doc and confirm its chunks vanish too. Then M5 is done — M6 is loading the real 5-panel corpus, no more code needed for that. |
 | 2026-07-18 | Tried the M5 review UI and gave feedback: no way to add a document from the UI, no visual way to see how documents/chunks relate, and the UI generally isn't user-friendly (asked specifically: no progress feedback, bare-bones design, hard to navigate). Confirmed chunk-level (not document-level) similarity graph is what's wanted, to be built now rather than deferred past M6. Built on `main` (sandbox still has no real Supabase): upload form + `uploadDocument` server action + `corpus ingest --json`; `/graph` page using `react-force-graph-2d` + a new `chunk_similarity_edges` Postgres function (HNSW-indexed per-chunk nearest-neighbours, not a full pairwise scan) exposed via Supabase RPC; persistent nav header, card-based layout, `AutoRefresh` polling component, and a pulsing status-dot for in-progress documents. `tsc`/`next build` clean across all three routes; `npm audit` shows no new vulnerabilities from the new dependency. Upload flow and graph rendering not verified against real data/browser (no credentials here). | Pull, `npm install`, apply the new `chunk_similarity_edges` migration, `npm run dev`, and actually use it: upload a real PDF, confirm it starts processing; open `/graph` once chunks are embedded and check nodes render/color/link correctly and clicking one highlights the right chunk; sanity-check the auto-refresh and new layout feel like a real improvement. Then this follow-up round (and M5 overall) is done — on to M6. |
 | 2026-07-18 | Asked whether the graph edges are "real links or making it up." Answer given: real cosine similarity over real embeddings (same pgvector operator/HNSW index the future chat app will use for retrieval at query time), not fabricated — but honestly limited to "these texts read as linguistically similar," which usually but not always tracks genuine topical relevance (boilerplate/table-structure text can false-positive; genuinely related content phrased differently can false-negative), and the 0.78/top-5 defaults are unvalidated guesses since there's barely any real corpus loaded yet. Then asked for improvements to actually understand the corpus before adding real files; picked click-to-preview, search-and-highlight, and topic clustering (declined a live threshold-filter slider). Built on `main` (still no real Supabase): `GraphPreviewPanel` (click a node, see full content + scored neighbours in a side panel, content fetched on demand via a new `getChunkContent` action so the graph page itself stays lightweight — dropped `content` from its chunk query entirely); search box wired to a new `corpus embed-query --json` CLI command (reuses `providers.py`, doesn't duplicate the NIM call in TS) + a new `search_chunks` Postgres function, highlighting matching nodes and fading the rest; a "Color: cluster" toggle using client-side union-find over the displayed edges (`lib/clustering.ts`) as an honest, documented-as-approximate stand-in for real topic modeling; a "Chunks"/"Documents" view toggle for a document-level zoom-out, aggregated client-side from the same edge data. Verified the two new pure-logic pieces (union-find, document-edge aggregation) standalone with hand-built test graphs before wiring into React, since this sandbox can't render canvas. `tsc`/`next build` clean across all four routes, no new `npm audit` findings. Interaction behavior (actual clicks/search/clustering against real embeddings) not verified — needs a real browser and real data. | Pull, install, apply both new migrations, `npm run dev`. Confirm the preview panel loads real content, run a real search query and sanity-check the matches, and — the actually interesting test — toggle cluster coloring once more than one document is loaded and judge honestly whether same-colored chunks across manuals read as related to a human, which is the real answer to "is this actually smart." Then start loading the rest of the real corpus (M6). |
+| 2026-07-18 | M6 started (real files going in), and search turned out to actually be broken: `Error: No such option '--json'` when running a real query. Root cause — `searchChunks` in `app/actions.ts` called `corpus embed-query <text> --json`, but `embed-query` (unlike `ingest`) never had a `--json` flag, it just always prints JSON; the flag was invalid and click rejected it. This shipped broken because the CLI-side test for `embed-query` only exercised the Python side directly, never the exact argv review-ui sends — a gap in how the CLI-from-Node integration points get tested. Reproduced the exact error with `CliRunner` first, then fixed by dropping the bad arg, then re-verified. Also asked how to verify documents without reading every one — built `lib/flags.ts`: cheap DB-only heuristics (zero chunks despite pages, low tokens/page, near-empty chunks, heavily-vision documents, the *specific* M4 prose-in-metadata pattern, missing doc_type), surfaced as a Flags column + "Flagged only" filter on the queue view and inline chunk highlighting on the document page. Verified the flag logic against 5 hand-built scenarios (including reproducing the real M4 prose bug to confirm it gets caught) before wiring in. `tsc`/`next build` clean, no new deps. | Pull, retry the search that failed (no reinstall needed), apply `search_chunks` if not already applied. Use the Flags column as the actual workflow going forward: open only what's flagged, spot-check a few unflagged documents occasionally to calibrate trust in the heuristics. Keep loading the real corpus. |

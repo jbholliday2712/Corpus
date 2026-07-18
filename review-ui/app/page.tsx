@@ -1,12 +1,11 @@
-import Link from "next/link";
 import { getSupabaseAdmin } from "@/lib/supabase";
 import type { DocumentRow } from "@/lib/types";
-import { deleteDocument, retryDocument, uploadDocument } from "./actions";
-import { ACTIVE_STATUSES, StatusBadge } from "@/components/StatusBadge";
-import { MetadataForm } from "@/components/MetadataForm";
-import { ConfirmSubmitButton } from "@/components/ConfirmSubmitButton";
+import { uploadDocument } from "./actions";
+import { ACTIVE_STATUSES } from "@/components/StatusBadge";
 import { UploadForm } from "@/components/UploadForm";
 import { AutoRefresh } from "@/components/AutoRefresh";
+import { DocumentTable } from "@/components/DocumentTable";
+import { computeDocumentFlags, type ChunkStat, type DocumentFlag } from "@/lib/flags";
 
 export const dynamic = "force-dynamic";
 
@@ -34,11 +33,42 @@ export default async function QueuePage({
   const docs = (documents ?? []) as DocumentRow[];
   const hasActiveDocument = docs.some((d) => ACTIVE_STATUSES.includes(d.status));
 
-  const { data: chunkDocIds } = await supabase.from("chunks").select("document_id");
+  // Lightweight per-chunk stats (no content) — enough to compute chunk
+  // counts and the flagging heuristics in lib/flags.ts without shipping any
+  // chunk text to this page.
+  const { data: chunkRows } = await supabase
+    .from("chunks")
+    .select("document_id, token_count, extraction_path");
+
   const chunkCounts = new Map<string, number>();
-  for (const row of chunkDocIds ?? []) {
-    const docId = (row as { document_id: string }).document_id;
-    chunkCounts.set(docId, (chunkCounts.get(docId) ?? 0) + 1);
+  const chunksByDoc = new Map<string, ChunkStat[]>();
+  for (const row of (chunkRows ?? []) as {
+    document_id: string;
+    token_count: number | null;
+    extraction_path: string | null;
+  }[]) {
+    chunkCounts.set(row.document_id, (chunkCounts.get(row.document_id) ?? 0) + 1);
+    const stat: ChunkStat = { tokenCount: row.token_count, extractionPath: row.extraction_path };
+    const list = chunksByDoc.get(row.document_id);
+    if (list) list.push(stat);
+    else chunksByDoc.set(row.document_id, [stat]);
+  }
+
+  const flagsByDoc = new Map<string, DocumentFlag[]>();
+  for (const doc of docs) {
+    flagsByDoc.set(
+      doc.id,
+      computeDocumentFlags(
+        {
+          pageCount: doc.page_count,
+          status: doc.status,
+          manufacturer: doc.manufacturer,
+          revision: doc.revision,
+          docType: doc.doc_type,
+        },
+        chunksByDoc.get(doc.id) ?? []
+      )
+    );
   }
 
   return (
@@ -69,75 +99,7 @@ export default async function QueuePage({
           <code>inbox/</code> and run <code>corpus watch</code>.
         </p>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white shadow-sm">
-          <table className="w-full min-w-[900px] border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-gray-200 bg-gray-50 text-left text-xs font-medium uppercase tracking-wide text-gray-500">
-                <th className="px-4 py-3">File</th>
-                <th className="px-4 py-3">Metadata</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">Chunks</th>
-                <th className="px-4 py-3">Error</th>
-                <th className="px-4 py-3">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {docs.map((doc) => (
-                <tr key={doc.id} className="border-b border-gray-100 align-top last:border-b-0 hover:bg-gray-50">
-                  <td className="px-4 py-3">
-                    <Link
-                      href={`/documents/${doc.id}`}
-                      className="font-medium text-blue-700 hover:underline"
-                    >
-                      {doc.file_name}
-                    </Link>
-                    <div className="text-xs text-gray-500">
-                      {doc.page_count ?? "?"} pages
-                    </div>
-                  </td>
-                  <td className="px-4 py-3">
-                    <MetadataForm doc={doc} />
-                  </td>
-                  <td className="px-4 py-3">
-                    <StatusBadge status={doc.status} />
-                    {doc.metadata_confirmed && (
-                      <div className="mt-1 text-xs text-green-700">
-                        metadata confirmed
-                      </div>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">{chunkCounts.get(doc.id) ?? 0}</td>
-                  <td className="max-w-xs whitespace-pre-wrap px-4 py-3 text-red-700">
-                    {doc.error_message ?? ""}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex flex-col items-start gap-2">
-                      {doc.status === "failed" && (
-                        <form action={retryDocument}>
-                          <input type="hidden" name="id" value={doc.id} />
-                          <button
-                            type="submit"
-                            className="rounded bg-amber-600 px-2 py-1 text-xs text-white hover:bg-amber-700"
-                          >
-                            Retry
-                          </button>
-                        </form>
-                      )}
-                      <form action={deleteDocument}>
-                        <input type="hidden" name="id" value={doc.id} />
-                        <ConfirmSubmitButton
-                          label="Delete"
-                          confirmText={`Delete ${doc.file_name}? This also deletes its chunks.`}
-                          className="rounded bg-red-600 px-2 py-1 text-xs text-white hover:bg-red-700"
-                        />
-                      </form>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <DocumentTable docs={docs} chunkCounts={chunkCounts} flagsByDoc={flagsByDoc} />
       )}
     </main>
   );

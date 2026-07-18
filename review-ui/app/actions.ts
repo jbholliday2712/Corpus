@@ -158,10 +158,12 @@ export async function searchChunks(
   // Embeds with the same provider/model the pipeline used to embed every
   // chunk (input_type="query", matching STATUS.md's "same embedding model
   // must be used at query time" rule) via the existing providers.py, rather
-  // than duplicating a NIM call in TypeScript.
+  // than duplicating a NIM call in TypeScript. `embed-query` always prints
+  // JSON — unlike `ingest`, it has no --json flag (and no human-readable
+  // mode to opt out of).
   const { stdout } = await execFileAsync(
     pythonBin,
-    ["-m", "corpus.cli", "embed-query", trimmed, "--json"],
+    ["-m", "corpus.cli", "embed-query", trimmed],
     { cwd: pipelineDir }
   );
   const { embedding } = JSON.parse(stdout.trim()) as { embedding: number[] };
