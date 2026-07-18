@@ -1,6 +1,5 @@
 import { getSupabaseAdmin } from "@/lib/supabase";
 import type { DocumentRow } from "@/lib/types";
-import { uploadDocument } from "./actions";
 import { UploadForm } from "@/components/UploadForm";
 import { DocumentTable } from "@/components/DocumentTable";
 import { computeDocumentFlags, type ChunkStat, type DocumentFlag } from "@/lib/flags";
@@ -100,7 +99,7 @@ export default async function QueuePage({
       </div>
 
       <div className="mb-6 rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
-        <UploadForm action={uploadDocument} />
+        <UploadForm />
       </div>
 
       {retrying && (

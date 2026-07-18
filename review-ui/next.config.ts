@@ -1,14 +1,10 @@
 import type { NextConfig } from "next";
 
-const nextConfig: NextConfig = {
-  experimental: {
-    // Server Actions default to a 1mb body limit; manuals routinely run to
-    // tens of MB, so the upload action (app/actions.ts:uploadDocument)
-    // needs this raised.
-    serverActions: {
-      bodySizeLimit: "50mb",
-    },
-  },
-};
+// Upload now goes through app/api/documents/upload (a Route Handler, not a
+// Server Action — see components/UploadForm.tsx for why), so the Server
+// Actions bodySizeLimit override that used to live here no longer applies
+// to anything; Route Handlers have no equivalent cap of their own on this
+// local-only app.
+const nextConfig: NextConfig = {};
 
 export default nextConfig;

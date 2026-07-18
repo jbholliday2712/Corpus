@@ -230,12 +230,14 @@ Pages:
    kicks off a background run (retry/reprocess/reset/approve/restore/
    upload) shows a spinner for the moment the request itself is in flight,
    not just a static label. Upload accepts one PDF or many at once
-   (`<input multiple>`) — a single upload keeps the original
-   redirect-to-that-document UX, a bulk upload redirects back to the queue
-   with an ingested/duplicate/failed summary banner; one bad PDF in a
-   batch doesn't abort the rest, matching `corpus watch`'s per-file
-   handling. The CLI-side equivalent for a whole folder without opening a
-   browser is `corpus ingest-dir <path> [--process]`.
+   (`<input multiple>`) with a real byte-level progress bar (XHR against
+   `POST /api/documents/upload`, not a server action — see §10 for why);
+   a single upload keeps the original redirect-to-that-document UX, a bulk
+   upload redirects back to the queue with an ingested/duplicate/failed
+   summary banner; one bad PDF in a batch doesn't abort the rest, matching
+   `corpus watch`'s per-file handling. The CLI-side equivalent for a whole
+   folder without opening a browser is `corpus ingest-dir <path>
+   [--process]`.
 2. **Document view** — chunks in order, rendered as markdown, showing page
    range, section, extraction path, token count per chunk. This is the
    inspection hatch: I check tables survived and sections make sense.
@@ -1420,6 +1422,69 @@ click approve. Repeat for every manual we use at work.
      failed without stopping the other uploads.
   4. Confirm the single-file upload path still behaves exactly as before
      (redirects straight to the new document's page).
+- [x] **Real upload progress bar**, requested after trying bulk upload —
+      the spinner/"Uploading…" state gave no sense of how much had
+      actually transferred. Built on `main` (sandbox still has no real
+      Supabase/NIM):
+  - The blocker: `<form action={serverAction}>` (what upload used until
+    now) only exposes a `pending` boolean via `useFormStatus` — there's no
+    way to observe bytes-sent through a Server Action. Real upload
+    progress needs `XMLHttpRequest`'s `upload.onprogress` (`fetch` has no
+    cross-browser upload-progress API), which means the request has to go
+    through an actual endpoint the client controls, not a server action.
+  - Moved upload off `app/actions.ts` entirely onto a new
+    `POST /api/documents/upload` Route Handler (same reasoning as the
+    reprocess/reset routes from earlier this session: client needs finer
+    control than a server action gives). It accepts one or more files,
+    does the same per-file ingest-then-detached-process work the old
+    `uploadDocument` server action did (one bad PDF doesn't abort the
+    batch), and returns a JSON summary instead of doing an HTTP redirect
+    (the client decides where to navigate, since it's driving the
+    request). The shared `ingestOne`/`startProcessing` helpers moved from
+    `app/actions.ts` into `lib/pipeline.ts` so both this route and (later)
+    anything else can use them without duplicating the subprocess-spawn
+    logic.
+  - `UploadForm` rewritten as a self-contained client component: reads
+    selected files via a ref (no more native form submission), POSTs them
+    with a hand-rolled `XMLHttpRequest` wrapped in a Promise, and renders
+    an actual percentage progress bar driven by `upload.onprogress`. Once
+    byte transfer hits 100% there's necessarily still a gap before the
+    server responds (hashing + DB insert per file) — shown as an
+    indeterminate "Finalizing…" pulse rather than a bar stuck at 100%
+    looking stalled. Single-file upload still redirects straight to that
+    document's page; multi-file still redirects to the queue's existing
+    `?bulkUploaded=`/`bulkDuplicates=`/`bulkFailed=` summary banner — both
+    now client-initiated (`router.push`) instead of server-side `redirect`.
+  - Deleted `uploadDocument` from `app/actions.ts` outright (fully
+    replaced, not left dead) and pruned the imports (`randomUUID`, `os`)
+    that were only used there. Also removed `next.config.ts`'s
+    `experimental.serverActions.bodySizeLimit: "50mb"` override — that
+    existed specifically because uploads went through a Server Action
+    (which defaults to a 1mb body cap); Route Handlers have no such cap on
+    this local-only app, so the override no longer does anything and the
+    stale comment would have been actively misleading left in place.
+  - `tsc --noEmit` clean, `next build` succeeds across all seven routes
+    (new: `/api/documents/upload`). `next dev` smoke-tested locally: an
+    empty POST 400s cleanly, and a POST with a real multipart file
+    correctly reaches (and fails on) the expected
+    `CORPUS_PYTHON`/`CORPUS_PIPELINE_DIR` missing-env error — confirms the
+    multipart parsing and route wiring work, not the real upload/ingest
+    path (no real pipeline env or browser `XMLHttpRequest` available in
+    this sandbox).
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`, `npm install` (no new deps), `npm run dev`.
+  2. Upload a real (multi-MB) manual PDF and actually watch the progress
+     bar move — confirm it reads sensibly (0→100%, then "Finalizing…"
+     briefly, then navigates to the document page). Try a multi-file
+     upload too and confirm the same bar tracks the combined batch.
+  3. Confirm a large file no longer hits any body-size-limit error now
+     that the old `serverActions.bodySizeLimit` override is gone (Route
+     Handlers shouldn't need one here, but this is the first real check of
+     that assumption).
+  4. Re-run the bulk-upload checklist from the previous entry (duplicate
+     handling, a deliberately-bad file, single-file redirect) since the
+     whole upload path was rewired, not just the progress bar layered on
+     top.
 
 ## 11. Session log
 
@@ -1446,4 +1511,5 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Root-caused the furniture-detection and confusing-graph-labels feedback from the same session down to one bug: `chunk.py`'s `_is_heading()` heuristic (short, single-line, no trailing punctuation) also matches vision-transcribed `**Label:** value` bold field lines, e.g. `**Page Number:** 4`. Once misclassified as a heading, that text becomes `chunk.section` — and thus `/graph`'s node/neighbor labels — for every chunk after it, so many unrelated chunks on many different real pages all showed the same misleading label, and clicking a "related chunk" correctly jumped to genuinely different content that just had a lying label (the edges/click behavior were never broken). Also explains why furniture detection missed it without needing the raw-page sample asked for last session: a field whose value is stuck at a constant "4" would still only appear on the subset of pages that went through the vision path, likely too few of the full 46 to cross `FURNITURE_MIN_PAGE_RATIO`. Fixed with a `_FIELD_VALUE_LINE_RE` guard in `_is_heading()`; 2 new tests (78/78 pipeline-wide) confirming the field line doesn't become `section` and doesn't clobber a real preceding heading. Not verified against the real document — the fix only helps once the affected document's chunks are regenerated. | Pull, install, `pytest` (78 passed expected). Reprocess the Enforcer V11 document **from 'chunk'** (via the reprocess controls built earlier this session) and reopen `/graph` — confirm `**Page Number:** 4`-style labels are gone and clicking a related chunk now makes sense relative to its label. Paste any other garbage label pattern that survives, rather than guessing at a broader fix up front. |
 | 2026-07-18 | Follow-up on the same real document: `/graph` also showing `**Table of Contents**` as the label for many unrelated real pages (not the actual TOC page), with high similarity scores between them. Same underlying bug class as the `**Page Number:** 4` fix earlier this session (`chunk.py`'s `_is_heading()` is too permissive), but a different literal phrase — the field-value regex didn't cover it since "Table of Contents" isn't a `Label: value` line. Generalized instead of special-casing another string: `chunk_pages` now runs a document-local pass (`_find_repeated_heading_texts`) that excludes any heading-shaped line repeating on 3+ distinct pages from ever being classified as a real heading, on the reasoning that a genuine section title is page-specific and essentially never repeats verbatim, while a much lower bar than clean.py's furniture threshold is worth it here since the failure mode of over-excluding is cheap (content is kept either way, only the `section` label falls back to the prior real heading). Also finally answers the original furniture-detection question from two sessions back without the raw-page sample that was asked for: a hallucinated phrase repeated only across the vision-processed subset of pages plausibly never reaches the furniture detector's ~30%-of-whole-document bar either. 5 new tests (83/83 pipeline-wide). Not verified against the real document — the same reprocess-from-'chunk' step covers both this and the earlier field-value fix. | Pull, install, `pytest` (83 passed expected). Reprocess the Enforcer V11 document from 'chunk' and reopen `/graph` — confirm both known garbage-label patterns are gone. If a third one shows up, paste it rather than have me guess at a broader rule. Also worth a gut check on whether 3 repeats is too aggressive once more real, larger manuals are loaded (a legitimately-reused heading text would lose its `section` label past that point) — it's a single constant to tune if so. |
 | 2026-07-18 | Asked about auto-discovering/scraping manuals from the internet given re-downloading/re-uploading each one by hand is tedious. Discussed rather than building it immediately: full autonomous scraping has real problems (matching the right manual/revision from search results is error-prone and could silently pollute the corpus with wrong documents, most manufacturer sites have no API so it'd mean fragile per-site scrapers, and bulk-automated downloading sits in a legal/ToS gray area even though a human clicking the same download link is normal) — laid out three tiers (bulk folder drop / ingest-by-URL / guided discovery-with-human-approval) and asked which to build first. Picked bulk folder drop. Built on `main` (sandbox still has no real Supabase/NIM): new `corpus ingest-dir <dir> [--process]` CLI command (one-shot bulk ingest of every PDF in a folder, `--process` to also run the full pipeline per document, one bad PDF doesn't abort the batch); review-ui's upload form now accepts multiple files at once, single-file UX unchanged, multi-file redirects to the queue with an ingested/duplicate/failed summary banner. First CLI-level test file (`test_cli.py`, 5 tests via `CliRunner` + monkeypatching) — 88/88 pipeline-wide. `tsc`/`next build` clean. Not run against real data — needs a real folder of PDFs and a real multi-file browser upload to verify. | Pull, install, `pytest` (88 passed expected), `npm run dev`. Try `corpus ingest-dir` against a real folder of manuals, and try a real multi-file browser upload including one deliberately-bad file to confirm the failure handling. Ingest-by-URL and guided discovery are still on the table if bulk drop isn't enough on its own. |
+| 2026-07-18 | Asked for a real upload progress bar (the spinner alone didn't show how much had transferred). Root problem: uploads went through a Server Action, which only exposes a pending/not-pending boolean — real byte-progress needs `XMLHttpRequest.upload.onprogress`, which needs an actual client-controlled endpoint. Moved upload off `app/actions.ts` onto a new `POST /api/documents/upload` Route Handler (same rationale as the reprocess/reset routes), moved the shared `ingestOne`/`startProcessing` helpers into `lib/pipeline.ts`, and rewrote `UploadForm` as a self-contained client component driving a hand-rolled XHR-based upload with a real percentage bar, transitioning to an indeterminate "Finalizing…" state once byte transfer completes but the server's still hashing/inserting. Single- and multi-file redirect behavior preserved, just client-initiated now. Deleted the old `uploadDocument` server action outright and removed the `next.config.ts` `serverActions.bodySizeLimit` override that existed only for it (Route Handlers have no equivalent cap here). `tsc`/`next build` clean across all seven routes; `next dev` smoke-tested (empty POST 400s, a real multipart POST reaches the expected missing-pipeline-env error) — no real browser/XHR or pipeline env available to verify the actual progress-bar behavior in this sandbox. | Pull, `npm install`, `npm run dev`. Upload a real multi-MB manual and actually watch the bar move end to end (0→100%→Finalizing→redirect), try a multi-file batch too, and re-run the duplicate/bad-file/single-file-redirect checks from last session since the whole upload path was rewired, not just the bar layered on top. |
 | 2026-07-19 | Added the cleaning stage per a fully-specified task (furniture stripping, structural page/chunk tagging, runt handling, >15% safety rail, Cleaning tab, furniture-detector unit tests) — one genuine gap in the spec: the repeated-safety-warning test case referenced "(see note below)" with no note attached. Asked and got a clear answer: add a keyword exception (`warning`/`caution`/`danger`/`note:`), never auto-strip that content regardless of repetition, given this is a fire/security panel corpus. Built `clean.py` (new), updated `chunk.py` (reads cleaned pages, runt handling, structural metadata), `cli.py` (`_process` gains a clean step + early-stop on the safety rail, new `restore-furniture` command), `db.py` (`delete_chunks`), a new migration (`documents.metadata` column, graph/search RPCs updated to respect the new exclusion rule), and the review UI's new Cleaning tab. Found and fixed two real logic bugs before they shipped (not caught by the spec, caught by testing): `apply_runt_handling` initially couldn't cascade-merge multiple consecutive runts (excluded already-runt-tagged chunks as merge targets, not just structural ones); `clean_pages` initially flattened cleaned lines with a single join, silently destroying the paragraph boundaries `chunk.py`'s splitting depends on. Also worked through several of my own test-fixture bugs (templated "page N" body text registering as furniture itself) before the real test suite was trustworthy. 65/65 pipeline tests passing (14 new for `clean.py`, 10 new for runt handling), 3 hand-built end-to-end scenarios verified via monkeypatched DB (safety rail correctly passes on realistic content, correctly trips and blocks chunk/embed on sparse content, `proceed_override` correctly unsticks it), `tsc`/`next build` clean across all four routes. Nothing verified against real Supabase/NIM/manuals — same sandbox constraint as every session. | Pull, reinstall (no new deps either side), apply the new migration, `pytest` (expect 65 passed). Run a real manual through and actually judge the heuristic against real content: does furniture.json look right, does a real TOC page get tagged, does a repeated real safety warning survive, is 15% the right safety-rail threshold. Try restoring a furniture line and toggling a structural/runt chunk's retrieval inclusion for real. Then back to loading the rest of the corpus (M6). |

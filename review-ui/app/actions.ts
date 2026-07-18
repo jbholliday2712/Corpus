@@ -1,9 +1,7 @@
 "use server";
 
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { revalidatePath } from "next/cache";
@@ -76,90 +74,6 @@ export async function retryDocument(formData: FormData): Promise<void> {
   child.unref();
 
   redirect(`/?retrying=${id}`);
-}
-
-async function ingestOne(
-  file: File,
-  pythonBin: string,
-  pipelineDir: string
-): Promise<{ id: string; duplicate: boolean }> {
-  // Stage the upload somewhere `corpus ingest` can read it from — it copies
-  // into store/<hash>.pdf itself, so this is just a scratch location.
-  const tmpPath = path.join(os.tmpdir(), `corpus-upload-${randomUUID()}.pdf`);
-  await fs.writeFile(tmpPath, Buffer.from(await file.arrayBuffer()));
-  try {
-    // Ingest (hash + DB insert) is fast — no NIM calls — so it's fine to
-    // await directly, unlike the full pipeline below.
-    const { stdout } = await execFileAsync(
-      pythonBin,
-      ["-m", "corpus.cli", "ingest", tmpPath, "--json"],
-      { cwd: pipelineDir }
-    );
-    const parsed = JSON.parse(stdout.trim()) as { id: string; duplicate?: boolean };
-    return { id: parsed.id, duplicate: Boolean(parsed.duplicate) };
-  } finally {
-    await fs.unlink(tmpPath).catch(() => {});
-  }
-}
-
-function startProcessing(id: string, pythonBin: string, pipelineDir: string): void {
-  // Same background-and-forget pattern as retry — extract/metadata/clean/
-  // chunk/embed can take minutes on a vision-heavy manual, and each
-  // document is its own detached process so one slow file in a bulk
-  // upload doesn't hold up the others.
-  const child = spawn(pythonBin, ["-m", "corpus.cli", "process", id], {
-    cwd: pipelineDir,
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
-}
-
-export async function uploadDocument(formData: FormData): Promise<void> {
-  const files = formData
-    .getAll("file")
-    .filter((f): f is File => f instanceof File && f.size > 0);
-  if (files.length === 0) {
-    throw new Error("No file selected.");
-  }
-  const nonPdf = files.find((f) => !f.name.toLowerCase().endsWith(".pdf"));
-  if (nonPdf) {
-    throw new Error(`Only .pdf files are accepted (got "${nonPdf.name}").`);
-  }
-
-  const { pythonBin, pipelineDir } = requirePipelineEnv();
-
-  // Single file keeps the original UX: errors surface directly, and a
-  // successful upload lands you on that document's page. A bulk upload
-  // (the <input multiple> case) instead reports a summary on the queue
-  // page, and — matching `corpus watch`'s per-file failure handling — one
-  // bad PDF in the batch must not abort the rest.
-  if (files.length === 1) {
-    const { id, duplicate } = await ingestOne(files[0], pythonBin, pipelineDir);
-    if (!duplicate) startProcessing(id, pythonBin, pipelineDir);
-    revalidatePath("/");
-    redirect(`/documents/${id}?${duplicate ? "duplicate" : "uploaded"}=1`);
-  }
-
-  let ingested = 0;
-  let duplicates = 0;
-  let failed = 0;
-  for (const file of files) {
-    try {
-      const { id, duplicate } = await ingestOne(file, pythonBin, pipelineDir);
-      if (duplicate) {
-        duplicates += 1;
-      } else {
-        ingested += 1;
-        startProcessing(id, pythonBin, pipelineDir);
-      }
-    } catch {
-      failed += 1;
-    }
-  }
-
-  revalidatePath("/");
-  redirect(`/?bulkUploaded=${ingested}&bulkDuplicates=${duplicates}&bulkFailed=${failed}`);
 }
 
 export async function getChunkContent(chunkId: string): Promise<string> {
