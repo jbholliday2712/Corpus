@@ -1,10 +1,10 @@
-"""Stage 0: intake a PDF into store/ and register it in `documents`. (M2)"""
+"""Stage 0: intake a PDF into store/ and register it in `documents`."""
 
 import hashlib
 import shutil
 from pathlib import Path
 
-STORE_DIR = Path(__file__).resolve().parent.parent.parent / "store"
+from corpus.paths import STORE_DIR
 
 
 def sha256_file(path: Path) -> str:

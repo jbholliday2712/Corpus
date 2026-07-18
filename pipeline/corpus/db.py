@@ -23,6 +23,12 @@ def ping() -> bool:
     return True
 
 
+def get_document(document_id: str) -> dict | None:
+    client = get_client()
+    res = client.table("documents").select("*").eq("id", document_id).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
 def get_document_by_hash(file_hash: str) -> dict | None:
     client = get_client()
     res = (
