@@ -336,9 +336,49 @@ click approve. Repeat for every manual we use at work.
       watch` or `corpus ingest` + `corpus process`, and eyeball the resulting
       chunks for genuine content quality (section headings, real tables,
       real procedures) — the synthetic test only proves the mechanics work,
-      not that chunking judgment is good on a real document. Once that
-      looks right, M2 is actually done and M3 (vision path + triage) can
-      start, pending `NIM_VISION_MODEL`.
+      not that chunking judgment is good on a real document.
+- [x] M3 code written (triage + vision path), same sandbox/no-`.env`
+      constraint as the M2 build — unit-tested and smoke-tested, not yet run
+      against real NIM vision:
+  - `extract.py`: `needs_vision(page, text)` triages each page — vision if
+    the text layer is under ~50 chars AND the rendered page isn't actually
+    blank (checked by rendering at 0.3x to grayscale and measuring the
+    non-white pixel fraction — catches scanned pages while leaving truly
+    blank pages on the cheap text path), OR if the extracted text looks
+    table-dense (≥65% of lines ≤20 chars, heuristic per STATUS.md, "tune
+    later"). Vision pages render at ~150 DPI and go through
+    `NIMClient.vision_transcribe` with the exact prompt from §4. The NIM
+    client is constructed lazily — a pure-text document still needs no
+    vision credentials at all.
+  - Page files now carry a one-line marker (`<!-- path: text|vision -->`)
+    so `chunk.py` knows which pages were vision-derived; `write_page`/
+    `read_page` in `extract.py` handle it (old M2-era page files without the
+    marker default to `text`, so nothing needed re-extracting).
+  - `chunk.py`: blocks now carry `extraction_path`; a chunk is marked
+    `vision` if *any* contributing page was vision-derived (conservative —
+    flags it for extra scrutiny in review), else `text`.
+  - New tests: `tests/test_extract.py` (7 — vision triage on a
+    synthetic scanned-looking page vs. a normal text page vs. a truly blank
+    page, table-density detection, page-marker round-trip) and 3 more in
+    `test_chunk.py` for extraction_path propagation. 17/17 passing overall.
+    Manually traced a synthetic mixed text+scanned 2-page PDF through
+    triage → page files → chunking (NIM call itself simulated, not made —
+    no credentials here) and confirmed the vision page was correctly routed
+    and the resulting chunk correctly flagged `vision`.
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`, reinstall (`pip install -e ".[dev]"` — no new deps), `pytest`
+     → should show 17 passed.
+  2. `NIM_VISION_MODEL` needs to actually be set in `.env` for this to do
+     anything real — check `corpus check`, fill it in if still blank.
+  3. Test with "the ugliest manual I've got" per the M3 brief: a scanned or
+     table-heavy PDF, via `corpus watch` or `ingest` + `process`. Watch the
+     `extract` step's timing — vision calls are sequential and can be slow,
+     that's expected (STATUS.md: "speed doesn't matter").
+  4. Eyeball `chunks.extraction_path` in Supabase — vision-derived chunks
+     should be flagged, and their `content` should look like sane markdown
+     transcription, not garbage or a refusal from the vision model.
+  5. Once that looks right, M3 is done; M4 (metadata inference + failure
+     handling/`corpus retry`) needs `NIM_LLM_MODEL` set.
 
 ## 11. Session log
 
@@ -349,3 +389,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | M1 finished: moved schema to `supabase/migrations/` + `config.toml` for the GitHub integration; renamed `.env.example` → `.env` and filled in real credentials; fixed local Norton SSL interception breaking Python HTTPS; caught a publishable-key-in-service-key-slot mistake; migration didn't auto-apply via the GitHub integration within ~3 min so applied it manually over `DATABASE_URL`. `corpus check` now fully green (Supabase reachable, tables exist, NIM embed confirms 1024 dims). | Confirm in the Supabase dashboard whether the GitHub integration is actually linked (Project Settings → Integrations → GitHub) so future migrations auto-apply; if not, keep using the manual `DATABASE_URL` apply. Then start M2. |
 | 2026-07-18 | M2 built on `main` (different session/sandbox than M1 — no `.env` here, so nothing was run against real Supabase/NIM). Implemented real `extract.py`/`chunk.py`/`embed.py`, added `corpus process`/wired `watch` to run the full pipeline, added `paths.py`. Unit-tested the chunker (7 passing tests) and smoke-tested PyMuPDF extraction against a synthetic PDF. | Run it for real: `git pull`, install, `pytest`, then feed it an actual manual via `corpus watch` and check the `chunks` table. Report back so M3 (vision path) can start. |
 | 2026-07-18 | Pulled M2 onto the laptop and ran it against real Supabase/NIM: `pytest` 7/7, then a synthetic 3-page PDF through `ingest` → `process` → verified `documents`/`chunks` rows in Supabase (table + procedure stayed intact in one chunk, embedding genuinely 1024 dims), then cleaned the test doc out. Mechanics confirmed working end-to-end. | Run the same flow against a real manual (not synthetic) to sign off M2 for real, then start M3 (vision path + triage) once `NIM_VISION_MODEL` is set. |
+| 2026-07-18 | M3 built on `main` (sandbox again has no `.env`). Added triage (`needs_vision`: thin-text-but-not-blank, or table-dense heuristics) and the vision extraction path to `extract.py`, a page-marker format so `chunk.py` knows which pages were vision-derived, and per-chunk `extraction_path` propagation. 10 new tests (17/17 total). Manually traced triage → page files → chunking against a synthetic mixed text/scanned PDF with the actual NIM call simulated (no credentials in this sandbox). | Run it for real: pull, install, `pytest` (17 passed expected), confirm `NIM_VISION_MODEL` is set, then feed it an actual scanned/table-heavy manual and check `chunks.extraction_path` + content quality in Supabase. Report back so M4 (metadata inference + failure handling) can start. |

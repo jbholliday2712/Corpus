@@ -30,6 +30,7 @@ class Block:
     page_start: int
     page_end: int
     kind: str  # 'heading' | 'table' | 'procedure' | 'text'
+    extraction_path: str = "text"  # 'text' | 'vision' — the page(s) it came from
 
 
 def _is_table(lines: list[str]) -> bool:
@@ -54,7 +55,7 @@ def _is_heading(para: str, lines: list[str]) -> bool:
     return True
 
 
-def _split_page_into_blocks(page_num: int, text: str) -> list[Block]:
+def _split_page_into_blocks(page_num: int, text: str, extraction_path: str) -> list[Block]:
     blocks = []
     for para in re.split(r"\n\s*\n", text.strip()):
         para = para.strip()
@@ -71,8 +72,20 @@ def _split_page_into_blocks(page_num: int, text: str) -> list[Block]:
             kind = "heading"
         else:
             kind = "text"
-        blocks.append(Block(text=para, page_start=page_num, page_end=page_num, kind=kind))
+        blocks.append(
+            Block(
+                text=para,
+                page_start=page_num,
+                page_end=page_num,
+                kind=kind,
+                extraction_path=extraction_path,
+            )
+        )
     return blocks
+
+
+def _combine_path(a: str, b: str) -> str:
+    return "text" if a == "text" and b == "text" else "vision"
 
 
 def _merge_adjacent_atomic(blocks: list[Block]) -> list[Block]:
@@ -87,6 +100,7 @@ def _merge_adjacent_atomic(blocks: list[Block]) -> list[Block]:
                 page_start=prev.page_start,
                 page_end=block.page_end,
                 kind=block.kind,
+                extraction_path=_combine_path(prev.extraction_path, block.extraction_path),
             )
         else:
             merged.append(block)
@@ -106,12 +120,13 @@ def _take_overlap(blocks: list[Block], overlap_tokens: int) -> list[Block]:
 
 def _finalize(blocks: list[Block], section: str | None) -> dict:
     content = "\n\n".join(b.text for b in blocks)
+    extraction_path = "text" if all(b.extraction_path == "text" for b in blocks) else "vision"
     return {
         "content": content,
         "page_start": min(b.page_start for b in blocks),
         "page_end": max(b.page_end for b in blocks),
         "section": section,
-        "extraction_path": "text",
+        "extraction_path": extraction_path,
         "token_count": estimate_tokens(content),
     }
 
@@ -162,12 +177,18 @@ def chunk_pages(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
 ) -> list[dict]:
-    """pages: [{"page": int, "text": str}, ...] in reading order.
+    """pages: [{"page": int, "text": str, "extraction_path": "text"|"vision"}, ...]
+    in reading order ("extraction_path" defaults to "text" if omitted).
     Returns chunk dicts with chunk_index/content/page_start/page_end/section/
-    extraction_path/token_count, ready to insert (minus document_id)."""
+    extraction_path/token_count, ready to insert (minus document_id). A
+    chunk's extraction_path is "vision" if any page it draws from was."""
     all_blocks: list[Block] = []
     for page in pages:
-        all_blocks.extend(_split_page_into_blocks(page["page"], page["text"]))
+        all_blocks.extend(
+            _split_page_into_blocks(
+                page["page"], page["text"], page.get("extraction_path", "text")
+            )
+        )
     all_blocks = _merge_adjacent_atomic(all_blocks)
 
     chunks = _pack_blocks(all_blocks, max_tokens, overlap_tokens)
@@ -178,6 +199,7 @@ def chunk_pages(
 
 def chunk_document(document_id: str) -> int:
     from corpus import db
+    from corpus.extract import read_page
     from corpus.paths import WORK_DIR
 
     doc_row = db.get_document(document_id)
@@ -189,9 +211,10 @@ def chunk_document(document_id: str) -> int:
     if not page_paths:
         raise FileNotFoundError(f"no extracted pages in {pages_dir} (run extract first)")
 
-    pages = [
-        {"page": int(p.stem), "text": p.read_text(encoding="utf-8")} for p in page_paths
-    ]
+    pages = []
+    for p in page_paths:
+        extraction_path, text = read_page(p)
+        pages.append({"page": int(p.stem), "text": text, "extraction_path": extraction_path})
 
     chunks = chunk_pages(pages)
     if chunks:

@@ -78,3 +78,29 @@ def test_overlap_carries_trailing_content_into_next_chunk():
 def test_estimate_tokens_is_positive_and_monotonic():
     assert estimate_tokens("x") >= 1
     assert estimate_tokens("a" * 400) > estimate_tokens("a" * 40)
+
+
+def test_all_text_pages_produce_text_extraction_path():
+    pages = [
+        {"page": 1, "text": "Ordinary paragraph one.", "extraction_path": "text"},
+        {"page": 2, "text": "Ordinary paragraph two.", "extraction_path": "text"},
+    ]
+    chunks = chunk_pages(pages)
+    assert all(c["extraction_path"] == "text" for c in chunks)
+
+
+def test_vision_page_flags_its_chunk_as_vision():
+    pages = [
+        {"page": 1, "text": "Digitally extracted paragraph.", "extraction_path": "text"},
+        {"page": 2, "text": "Vision-transcribed paragraph.", "extraction_path": "vision"},
+    ]
+    chunks = chunk_pages(pages, max_tokens=5, overlap_tokens=0)
+    by_page = {c["page_start"]: c for c in chunks}
+    assert by_page[1]["extraction_path"] == "text"
+    assert by_page[2]["extraction_path"] == "vision"
+
+
+def test_extraction_path_defaults_to_text_when_omitted():
+    pages = [{"page": 1, "text": "No extraction_path key supplied."}]
+    chunks = chunk_pages(pages)
+    assert chunks[0]["extraction_path"] == "text"
