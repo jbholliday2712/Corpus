@@ -585,21 +585,58 @@ click approve. Repeat for every manual we use at work.
     two calls when the second call finds `doc_type` already set, and (2)
     `chunk_document` does not call `insert_chunks` again when chunks already
     exist for the document, returning the existing count instead.
-- [ ] **Needs to happen on your machine:**
-  1. `git pull`, reinstall (`pip install -e ".[dev]"` — no new deps), `pytest`
-     → should show 41 passed.
-  2. `NIM_LLM_MODEL` needs to actually be set in `.env` — check `corpus
-     check`, fill it in if still blank (it was blank as of the M3 session).
-  3. Test metadata inference against a real manual: `ingest` + `process` (or
-     `watch`), then check the `documents` row in Supabase —
-     manufacturer/panel_model/doc_type/revision should be populated and
-     sane, `metadata_confirmed` still `false`.
-  4. Test `corpus retry` for real: pick a document, manually null out its
-     `embedding` on one chunk (or find/force a genuine failure — e.g. break
-     `NIM_API_KEY` temporarily mid-embed), confirm status goes to `failed`,
-     then `corpus retry <id>` and confirm it resumes cleanly — watch the
-     log output for "metadata inference skipped"/stage-skip behavior if
-     applicable, and confirm no duplicate chunks or wasted re-embeds happen.
+- [x] **M4 verified end-to-end against real Supabase/NIM.** Pulled,
+      reinstalled, `pytest` → 41/41. Set
+      `NIM_LLM_MODEL=meta/llama-3.3-70b-instruct` (was blank) and
+      sanity-checked it with a direct call before running the pipeline.
+  - **Metadata inference**, re-run on the real Enforcer V11 manual:
+    `panel_model` "ENFORCER V11", `doc_type` "install_manual", `revision`
+    "03" all came back clean and correct. `manufacturer` did not — it came
+    back as `"Pyronix (implied, not explicitly stated but Enforcer V11 is a
+    known model of Pyronix)"`, the model's reasoning baked straight into the
+    field value, despite the prompt saying "Respond ONLY as JSON." Reran on
+    a second (synthetic) document to check it wasn't a one-off: same
+    pattern, this time on `manufacturer` *and* `revision` (`"Not explicitly
+    stated, but likely Apollo or a similar fire alarm systems manufacturer
+    given the context of the XFP panel"` / `"Not present in the provided
+    text"` instead of `null`). Confirmed pattern, not a fluke.
+    `_parse_metadata_response` only validates/coerces `doc_type`;
+    manufacturer/panel_model/revision are stored as whatever string comes
+    back, unvalidated. Lower severity than the M3 vision hallucination —
+    it's not inventing a false fact, just failing to follow the
+    ONLY-the-value instruction — and `metadata_confirmed` stays `false`
+    specifically so a human catches this in review before it's trusted. Not
+    fixed; flagging for a decision (see below).
+  - **`corpus retry`**, tested against a genuine failure, not just
+    idempotency: forced a real embed-stage failure (temporary bogus
+    `NIM_EMBED_MODEL` env override, not touching `.env`) on a synthetic
+    document. Confirmed `status` → `failed` with the real HTTP error
+    captured in `error_message`, and the chunk existed with a `null`
+    embedding. Restored the correct model and ran `corpus retry <id>`: it
+    skipped re-extracting (pages already on disk), skipped re-calling the
+    LLM (`doc_type` already set), skipped re-inserting the chunk (already
+    existed), and correctly only redid the embed step that had actually
+    failed. Final state: `status=review`, `error_message` cleared to
+    `null`, still exactly 1 chunk (no duplication). Also re-ran `corpus
+    retry` on the *already-successful* Enforcer V11 document as a pure
+    idempotency check — confirmed 0 wasted work across every stage (0
+    chunks re-embedded, chunk count unchanged, no duplicate LLM/vision
+    calls). Both the crash-recovery path and the idempotency path work as
+    designed.
+  - Cleaned up both test documents (Supabase rows + `store/`/`work/` files)
+    afterward — source PDFs untouched, both re-ingestable later.
+- [ ] **Decision needed:** how to stop the LLM from writing explanatory
+      prose into `manufacturer`/`revision` instead of a clean value or
+      `null`. Options: tighten the prompt further (e.g. explicit "the value
+      must be a short string or null, never an explanation — if unsure,
+      use null" — though M3's experience with prompt-only fixes for the
+      vision model failing outright is a reason for skepticism this alone
+      will hold up), or add post-processing validation (e.g. reject/null
+      out a field if it's implausibly long for what it's supposed to hold,
+      similar in spirit to how `doc_type` is already coerced against an
+      enum). Not urgent to block on — `metadata_confirmed=false` means
+      review UI already catches it — but worth deciding before M5 if the
+      review UI is expected to show these fields as clean, editable text.
   5. Once that looks right, M4 is done. M5 (review UI) is next — no NIM
      model needed for that, just Next.js talking to the same Supabase.
 
@@ -618,3 +655,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Pulled the repetition-loop fix, `pytest` 27/27. Re-ran the same synthetic repro PDF live — this time the model didn't reproduce the exact runaway loop (only echoed the table twice inside a hallucinated narrative, which is correctly left alone since the rule is "more than twice"). Since live calls aren't reliably reproducible, verified the fix more directly: fed the exact originally-captured 30x-repeated text straight into `_detect_repetition` and confirmed it truncates cleanly to one copy. Also reconfirmed the hallucination-on-blank-page issue is real (separate, still-open, not addressed by this fix). Cleaned up the test document. | Test against a real scanned/table-heavy manual (not synthetic) and eyeball chunk quality in Supabase. Decide later whether the hallucination-on-low-content-page risk needs a guard. Then start M4. |
 | 2026-07-18 | Tested M3 against a real manual (Pyronix Enforcer V11 install guide, 16 pages) for the first time. Legitimate vision pages (real tables/diagrams) transcribed accurately. Confirmed the hallucination risk for real: the back cover (solid color blocks + logo, zero real content) made the vision model fabricate an entire fake manual with invented specs/warranty/phone number. First fix attempt (prompt sentinel asking the model to say "NO_CONTENT") failed outright — the model ignored it and hallucinated something different instead. Real fix: `_is_flat_graphic(page)` in `extract.py`, a row-coverage pixel-variance heuristic that keeps flat-design pages off the vision path entirely rather than trusting the model to decline. Validated directly against the real page repeatedly during development (a naive cell-fraction version wrongly still let the real cover through; row-coverage fixed it). 6 new tests (33/33 total). Re-ran the real document end to end: chunk count correctly dropped 9→8, no fabricated chunk. Accidentally deleted the real ingested document during test cleanup (autopilot from the synthetic-test pattern); caught it, asked, left deleted per instruction — source PDF untouched in Downloads. | M3 is done (mechanics + the one real quality issue found). Start M4 (metadata inference + failure handling), needs `NIM_LLM_MODEL` set. Residual: `_is_flat_graphic` only catches flat-color-block pages, not other hallucination shapes — revisit if a different manual surfaces one. |
 | 2026-07-18 | M4 built on `main` (sandbox again has no `.env`). Added `metadata.py` (LLM metadata inference, resumable, wired into `_process` as best-effort/non-fatal). Implemented `corpus retry` for real — found and fixed a resumability gap along the way: `chunk_document` was re-inserting a duplicate chunk set on every call, which would have defeated `embed_document`'s resumability (and wasted NIM quota) on a retry-after-embed-failure; fixed with a `db.count_chunks` existence check, mirroring how extract/embed already skip completed work. 8 new tests (41/41 total); also manually verified (monkeypatched DB/NIM) that both `infer_metadata` and `chunk_document` correctly skip redoing work on a second call. | Pull, install, `pytest` (41 passed expected), set `NIM_LLM_MODEL`, then run metadata inference against a real manual and check the `documents` row. Test `corpus retry` against a real induced failure to confirm it resumes cleanly without wasting NIM calls. Then M5 (review UI). |
+| 2026-07-18 | Pulled M4, `pytest` 41/41, set `NIM_LLM_MODEL=meta/llama-3.3-70b-instruct` (was blank). Metadata inference on the real Enforcer V11 manual: panel_model/doc_type/revision came back clean, but `manufacturer` came back with the model's reasoning baked into the value instead of a clean string (e.g. `"Pyronix (implied, not explicitly stated but...)"`)  — reproduced the same pattern on a second document, confirming it's systemic, not a fluke. `corpus retry` tested against a genuine forced failure (bogus embed model), not just idempotency: confirmed failed→retry→review with the error cleared, no duplicate chunks, no wasted NIM calls on stages that already succeeded — also confirmed 0 wasted work retrying an already-successful document. Cleaned up both test documents afterward (source PDFs untouched). | Decide how to stop the LLM from writing prose into manufacturer/revision fields (tighten prompt further vs. add post-processing validation) before M5's review UI needs to show these as clean editable fields. Otherwise M4 is done — start M5 (review UI). |
