@@ -10,7 +10,8 @@
     "@supabase/supabase-js": "^2.110.7",
     "next": "^16.2.10",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-force-graph-2d": "^1.29.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",

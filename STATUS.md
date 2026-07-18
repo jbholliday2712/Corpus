@@ -697,29 +697,81 @@ click approve. Repeat for every manual we use at work.
     `SUPABASE_URL / SUPABASE_SERVICE_KEY are not set` error message (from
     `lib/supabase.ts`) rather than crashing, i.e. the app fails predictably
     without credentials instead of breaking in some opaque way.
+- [x] **Post-M5 feedback addressed** — you tried the review UI and flagged
+      three gaps: no way to add a document from the UI, no visual feedback
+      on how documents relate to each other, and general un-friendliness
+      (no live progress, bare-bones design, hard to navigate). All three
+      built:
+  - **Upload (queue view):** `corpus ingest` gets a `--json` flag
+    (`{id, duplicate, file_name}`) for programmatic use. A new
+    `uploadDocument` server action stages the uploaded file to a temp path,
+    awaits `corpus ingest --json` (fast, no NIM calls) for the document id,
+    then fires `corpus process <id>` as a detached background process —
+    same fire-and-forget pattern as Retry, since extract/metadata/chunk/
+    embed can take minutes. Redirects to the new document's page with an
+    "uploaded, updates automatically" or "already ingested" banner.
+    `next.config.ts`'s Server Actions body limit raised to 50mb (manuals
+    routinely exceed the 1mb default).
+  - **Chunk-level similarity graph** (`/graph`, new nav link): nodes are
+    individual chunks (not documents — you picked chunk-level explicitly),
+    colored by source document, edges are embedding cosine similarity
+    &ge;0.78 (top 5 neighbours per chunk). New migration
+    `chunk_similarity_edges.sql` adds a Postgres function that walks the
+    existing HNSW index per-chunk via a lateral join rather than a full
+    pairwise scan, so it stays cheap as the corpus grows — call it via
+    Supabase RPC. Rendered with `react-force-graph-2d` (canvas-based,
+    dynamically imported client-side only). Clicking a node navigates to
+    `/documents/<id>#chunk-<chunkId>`; the document page gives every chunk
+    that id and `globals.css` adds a plain CSS `:target` outline rule, so
+    the linked chunk is highlighted with zero extra JS. Will look sparse
+    with only a document or two loaded — expected to get more interesting
+    once M6 loads the real 5-panel corpus.
+  - **UX pass:** persistent header/nav (`app/layout.tsx`) across Queue and
+    Graph; card-based layout instead of a bare table (rounded borders,
+    shadows, consistent spacing); `AutoRefresh` client component
+    (`router.refresh()` every 4s) rendered only on pages with a document in
+    an active status (`queued`/`extracting`/`chunking`/`embedding`), so
+    status changes show up without a manual reload — banners updated from
+    "reload this page" to "updates automatically" accordingly; a small
+    pulsing-dot indicator on `StatusBadge` for active statuses as an
+    at-a-glance "something's happening" cue.
+  - Real dependency check: `react-force-graph-2d` added cleanly, `npm
+    audit` shows the same 2 pre-existing moderate vulnerabilities as before
+    (both inside Next.js's own bundled postcss, unrelated to this) — no new
+    ones introduced.
+  - **Verified in this sandbox** (still no real Supabase/`.env.local`
+    here): `tsc --noEmit` clean, `next build` succeeds with all three
+    routes (`/`, `/documents/[id]`, `/graph`) correctly dynamic, and `next
+    dev` boots and serves all three with the expected clean
+    `SUPABASE_URL / SUPABASE_SERVICE_KEY are not set` 500 rather than
+    crashing. The graph's actual rendering (force layout, node click,
+    `:target` highlight) and the upload flow end-to-end are **not**
+    verified against real data/browser — can't be, no credentials or a
+    browser with real corpus data available here.
 - [ ] **Needs to happen on your machine:**
-  1. `git pull`. `cd review-ui && npm install`.
-  2. `cp .env.local.example .env.local`, fill in `SUPABASE_URL` /
-     `SUPABASE_SERVICE_KEY` (same values as `pipeline/.env`), and
-     `CORPUS_PYTHON` (path to the pipeline venv's python executable) /
-     `CORPUS_PIPELINE_DIR` (path to `pipeline/`) for the Retry button.
-  3. `npm run dev`, open `http://localhost:3000` — should show the real
-     document queue (whatever's currently in Supabase from earlier M2-M4
-     testing, if anything's left after cleanup).
-  4. Exercise the golden path in an actual browser: open a document, check
-     chunks render correctly (tables/procedures readable, vision-flagged
-     chunks visible), confirm/edit metadata on the queue view (including
-     cleaning up one of the "explanatory prose" manufacturer/revision
-     values from the M4 findings, if one's still sitting there), approve a
-     `review`-status document to `done`, and — if there's a genuinely
-     `failed` document sitting around — click Retry and confirm it resumes
-     in the background and the queue reflects the new status after a
-     reload. Delete something disposable (a test document) to check the
-     cascade actually removes its chunks too.
-  5. Once that's confirmed working against real data in a real browser, M5
-     is done. M6 is loading the real corpus (the 5 panels actually used at
-     work) — no more code changes needed for that, just running the
-     pipeline for real and reviewing every document.
+  1. `git pull`. `cd review-ui && npm install` (picks up
+     `react-force-graph-2d`). Apply the new migration
+     (`supabase/migrations/..._chunk_similarity_edges.sql`) the same way
+     the initial schema was applied (manual `DATABASE_URL`/`psycopg2` apply
+     unless you've since confirmed the GitHub integration auto-applies).
+  2. `npm run dev`, open `http://localhost:3000`.
+  3. **Upload:** pick a real PDF via the new upload form on the queue view,
+     confirm it redirects to the document page with the "uploaded" banner,
+     and that it actually starts processing (status moves off `queued`
+     within the auto-refresh interval).
+  4. **Graph:** once at least one document has embedded chunks, open
+     `/graph` and confirm nodes render, are colored per document, and
+     clicking one navigates to and highlights the right chunk on the
+     document page. With few documents this may look sparse/mostly
+     unconnected — that's expected, not a bug.
+  5. **UX pass:** confirm the queue/document pages now auto-update while
+     something's processing (no manual reload needed), and that the new
+     card-based layout/nav feel like a real improvement — flag anything
+     that still feels off.
+  6. Once that's confirmed, M5 (plus this follow-up round) is genuinely
+     done. M6 is loading the real 5-panel corpus — no more code needed for
+     that, just running the pipeline for real and reviewing every document
+     (the graph should get meaningfully more interesting once that's in).
 
 ## 11. Session log
 
@@ -738,3 +790,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | M4 built on `main` (sandbox again has no `.env`). Added `metadata.py` (LLM metadata inference, resumable, wired into `_process` as best-effort/non-fatal). Implemented `corpus retry` for real — found and fixed a resumability gap along the way: `chunk_document` was re-inserting a duplicate chunk set on every call, which would have defeated `embed_document`'s resumability (and wasted NIM quota) on a retry-after-embed-failure; fixed with a `db.count_chunks` existence check, mirroring how extract/embed already skip completed work. 8 new tests (41/41 total); also manually verified (monkeypatched DB/NIM) that both `infer_metadata` and `chunk_document` correctly skip redoing work on a second call. | Pull, install, `pytest` (41 passed expected), set `NIM_LLM_MODEL`, then run metadata inference against a real manual and check the `documents` row. Test `corpus retry` against a real induced failure to confirm it resumes cleanly without wasting NIM calls. Then M5 (review UI). |
 | 2026-07-18 | Pulled M4, `pytest` 41/41, set `NIM_LLM_MODEL=meta/llama-3.3-70b-instruct` (was blank). Metadata inference on the real Enforcer V11 manual: panel_model/doc_type/revision came back clean, but `manufacturer` came back with the model's reasoning baked into the value instead of a clean string (e.g. `"Pyronix (implied, not explicitly stated but...)"`)  — reproduced the same pattern on a second document, confirming it's systemic, not a fluke. `corpus retry` tested against a genuine forced failure (bogus embed model), not just idempotency: confirmed failed→retry→review with the error cleared, no duplicate chunks, no wasted NIM calls on stages that already succeeded — also confirmed 0 wasted work retrying an already-successful document. Cleaned up both test documents afterward (source PDFs untouched). | Decide how to stop the LLM from writing prose into manufacturer/revision fields (tighten prompt further vs. add post-processing validation) before M5's review UI needs to show these as clean editable fields. Otherwise M4 is done — start M5 (review UI). |
 | 2026-07-18 | M5 built on `main` (sandbox again has no real Supabase): `review-ui/`, a minimal Next.js 16 App Router + TypeScript + Tailwind v4 app with the queue view and document view from STATUS.md §5. Queue view's metadata fields are plain editable inputs (not read-only) specifically because of the prose-in-manufacturer/revision finding from the last session — review here means "look and fix," which is the mitigation for that still-open decision. Retry button shells out to `python -m corpus.cli retry <id>` as a detached background process rather than reimplementing retry logic in JS. Hit and root-caused a real build break: `npm install` resolved `typescript` to `7.0.2`, which crashed Next's internal type-check with an opaque low-level Node error; pinned to `^5.9.3` (what Next 16.2.10 actually expects) after confirming via `ignoreBuildErrors` that the crash was specifically in the TS step. `next build` (Turbopack, the default) succeeds cleanly; noted but didn't chase a separate `--webpack` path-alias resolution failure since Turbopack is what this app actually uses. `next dev` boots and both routes correctly fail with a clean "SUPABASE_URL / SUPABASE_SERVICE_KEY are not set" 500 rather than crashing, since no real Supabase is reachable from here. | Pull, `npm install`, set up `review-ui/.env.local` from the example (same Supabase creds as `pipeline/.env`, plus CORPUS_PYTHON/CORPUS_PIPELINE_DIR for Retry), `npm run dev`, and actually use it in a browser against real data: open a document, check chunk rendering, edit/confirm metadata, approve a review-status doc, retry a failed one if any exist, delete a disposable test doc and confirm its chunks vanish too. Then M5 is done — M6 is loading the real 5-panel corpus, no more code needed for that. |
+| 2026-07-18 | Tried the M5 review UI and gave feedback: no way to add a document from the UI, no visual way to see how documents/chunks relate, and the UI generally isn't user-friendly (asked specifically: no progress feedback, bare-bones design, hard to navigate). Confirmed chunk-level (not document-level) similarity graph is what's wanted, to be built now rather than deferred past M6. Built on `main` (sandbox still has no real Supabase): upload form + `uploadDocument` server action + `corpus ingest --json`; `/graph` page using `react-force-graph-2d` + a new `chunk_similarity_edges` Postgres function (HNSW-indexed per-chunk nearest-neighbours, not a full pairwise scan) exposed via Supabase RPC; persistent nav header, card-based layout, `AutoRefresh` polling component, and a pulsing status-dot for in-progress documents. `tsc`/`next build` clean across all three routes; `npm audit` shows no new vulnerabilities from the new dependency. Upload flow and graph rendering not verified against real data/browser (no credentials here). | Pull, `npm install`, apply the new `chunk_similarity_edges` migration, `npm run dev`, and actually use it: upload a real PDF, confirm it starts processing; open `/graph` once chunks are embedded and check nodes render/color/link correctly and clicking one highlights the right chunk; sanity-check the auto-refresh and new layout feel like a real improvement. Then this follow-up round (and M5 overall) is done — on to M6. |

@@ -3,7 +3,8 @@ import { notFound } from "next/navigation";
 import { getSupabaseAdmin } from "@/lib/supabase";
 import type { ChunkRow, DocumentRow } from "@/lib/types";
 import { approveDocument } from "@/app/actions";
-import { StatusBadge } from "@/components/StatusBadge";
+import { ACTIVE_STATUSES, StatusBadge } from "@/components/StatusBadge";
+import { AutoRefresh } from "@/components/AutoRefresh";
 
 export const dynamic = "force-dynamic";
 
@@ -26,7 +27,7 @@ export default async function DocumentPage({
 
   if (docError) {
     return (
-      <main className="mx-auto max-w-4xl p-8">
+      <main className="mx-auto max-w-4xl px-8 py-8">
         <p className="text-red-600">Failed to load document: {docError.message}</p>
       </main>
     );
@@ -42,26 +43,29 @@ export default async function DocumentPage({
   const typedChunks = (chunks ?? []) as ChunkRow[];
 
   return (
-    <main className="mx-auto max-w-4xl p-8">
+    <main className="mx-auto max-w-4xl px-8 py-8">
+      {ACTIVE_STATUSES.includes(typedDoc.status) && <AutoRefresh />}
+
       <Link href="/" className="text-sm text-blue-700 hover:underline">
         &larr; Back to queue
       </Link>
 
       {uploaded && (
-        <p className="mt-4 rounded bg-blue-50 px-3 py-2 text-sm text-blue-800">
+        <p className="mt-4 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-800">
           Uploaded. Processing (extract → metadata → chunk → embed) is
-          running in the background — reload this page in a bit to see
-          chunks appear.
+          running in the background — this page updates automatically.
         </p>
       )}
       {duplicate && (
-        <p className="mt-4 rounded bg-amber-50 px-3 py-2 text-sm text-amber-800">
+        <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
           This file was already ingested (matching content hash) — showing
           the existing document instead of re-processing it.
         </p>
       )}
 
-      <h1 className="mt-2 mb-1 text-2xl font-semibold">{typedDoc.file_name}</h1>
+      <h1 className="mt-3 mb-2 text-2xl font-semibold text-gray-900">
+        {typedDoc.file_name}
+      </h1>
       <p className="mb-6 flex flex-wrap items-center gap-2 text-sm text-gray-600">
         <span>{typedDoc.manufacturer ?? "?"}</span>
         <span>&middot;</span>
@@ -77,7 +81,7 @@ export default async function DocumentPage({
       </p>
 
       {typedDoc.error_message && (
-        <p className="mb-6 whitespace-pre-wrap rounded bg-red-50 px-3 py-2 text-sm text-red-700">
+        <p className="mb-6 whitespace-pre-wrap rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
           {typedDoc.error_message}
         </p>
       )}
@@ -94,7 +98,7 @@ export default async function DocumentPage({
         </form>
       )}
       {typedDoc.status === "done" && (
-        <p className="mb-8 inline-block rounded bg-green-100 px-3 py-1.5 text-sm text-green-800">
+        <p className="mb-8 inline-block rounded-lg bg-green-100 px-3 py-1.5 text-sm text-green-800">
           Approved — live for the chat app.
         </p>
       )}
@@ -103,9 +107,13 @@ export default async function DocumentPage({
         <p className="text-red-600">Failed to load chunks: {chunksError.message}</p>
       )}
 
-      <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-4">
         {typedChunks.map((chunk) => (
-          <article key={chunk.id} className="rounded border p-4">
+          <article
+            key={chunk.id}
+            id={`chunk-${chunk.id}`}
+            className="scroll-mt-4 rounded-lg border border-gray-200 bg-white p-4 shadow-sm"
+          >
             <div className="mb-2 flex flex-wrap gap-3 text-xs text-gray-500">
               <span>#{chunk.chunk_index}</span>
               <span>
@@ -127,7 +135,9 @@ export default async function DocumentPage({
           </article>
         ))}
         {typedChunks.length === 0 && (
-          <p className="text-gray-500">No chunks yet.</p>
+          <p className="rounded-lg border border-dashed border-gray-300 bg-white p-6 text-center text-gray-500">
+            No chunks yet.
+          </p>
         )}
       </div>
     </main>

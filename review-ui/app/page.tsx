@@ -2,10 +2,11 @@ import Link from "next/link";
 import { getSupabaseAdmin } from "@/lib/supabase";
 import type { DocumentRow } from "@/lib/types";
 import { deleteDocument, retryDocument, uploadDocument } from "./actions";
-import { StatusBadge } from "@/components/StatusBadge";
+import { ACTIVE_STATUSES, StatusBadge } from "@/components/StatusBadge";
 import { MetadataForm } from "@/components/MetadataForm";
 import { ConfirmSubmitButton } from "@/components/ConfirmSubmitButton";
 import { UploadForm } from "@/components/UploadForm";
+import { AutoRefresh } from "@/components/AutoRefresh";
 
 export const dynamic = "force-dynamic";
 
@@ -24,13 +25,14 @@ export default async function QueuePage({
 
   if (error) {
     return (
-      <main className="mx-auto max-w-6xl p-8">
+      <main className="mx-auto max-w-6xl px-8 py-8">
         <p className="text-red-600">Failed to load documents: {error.message}</p>
       </main>
     );
   }
 
   const docs = (documents ?? []) as DocumentRow[];
+  const hasActiveDocument = docs.some((d) => ACTIVE_STATUSES.includes(d.status));
 
   const { data: chunkDocIds } = await supabase.from("chunks").select("document_id");
   const chunkCounts = new Map<string, number>();
@@ -40,43 +42,52 @@ export default async function QueuePage({
   }
 
   return (
-    <main className="mx-auto max-w-6xl p-8">
-      <h1 className="mb-6 text-2xl font-semibold">Corpus — Document Queue</h1>
+    <main className="mx-auto max-w-6xl px-8 py-8">
+      {hasActiveDocument && <AutoRefresh />}
 
-      <UploadForm action={uploadDocument} />
+      <div className="mb-6 flex items-center justify-between">
+        <h1 className="text-2xl font-semibold text-gray-900">Document Queue</h1>
+        <span className="text-sm text-gray-500">
+          {docs.length} document{docs.length === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      <div className="mb-6 rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
+        <UploadForm action={uploadDocument} />
+      </div>
 
       {retrying && (
-        <p className="mb-4 rounded bg-blue-50 px-3 py-2 text-sm text-blue-800">
-          Retry started for document {retrying}. It runs in the background —
-          reload this page in a bit to see the updated status.
+        <p className="mb-4 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-800">
+          Retry started for document {retrying}. This page updates
+          automatically once it finishes.
         </p>
       )}
 
       {docs.length === 0 ? (
-        <p className="text-gray-500">
+        <p className="rounded-lg border border-dashed border-gray-300 bg-white p-6 text-center text-gray-500">
           No documents yet. Upload a PDF above, or drop one in{" "}
           <code>inbox/</code> and run <code>corpus watch</code>.
         </p>
       ) : (
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white shadow-sm">
           <table className="w-full min-w-[900px] border-collapse text-sm">
             <thead>
-              <tr className="border-b text-left">
-                <th className="py-2 pr-4">File</th>
-                <th className="py-2 pr-4">Metadata</th>
-                <th className="py-2 pr-4">Status</th>
-                <th className="py-2 pr-4">Chunks</th>
-                <th className="py-2 pr-4">Error</th>
-                <th className="py-2 pr-4">Actions</th>
+              <tr className="border-b border-gray-200 bg-gray-50 text-left text-xs font-medium uppercase tracking-wide text-gray-500">
+                <th className="px-4 py-3">File</th>
+                <th className="px-4 py-3">Metadata</th>
+                <th className="px-4 py-3">Status</th>
+                <th className="px-4 py-3">Chunks</th>
+                <th className="px-4 py-3">Error</th>
+                <th className="px-4 py-3">Actions</th>
               </tr>
             </thead>
             <tbody>
               {docs.map((doc) => (
-                <tr key={doc.id} className="border-b align-top">
-                  <td className="py-2 pr-4">
+                <tr key={doc.id} className="border-b border-gray-100 align-top last:border-b-0 hover:bg-gray-50">
+                  <td className="px-4 py-3">
                     <Link
                       href={`/documents/${doc.id}`}
-                      className="text-blue-700 hover:underline"
+                      className="font-medium text-blue-700 hover:underline"
                     >
                       {doc.file_name}
                     </Link>
@@ -84,10 +95,10 @@ export default async function QueuePage({
                       {doc.page_count ?? "?"} pages
                     </div>
                   </td>
-                  <td className="py-2 pr-4">
+                  <td className="px-4 py-3">
                     <MetadataForm doc={doc} />
                   </td>
-                  <td className="py-2 pr-4">
+                  <td className="px-4 py-3">
                     <StatusBadge status={doc.status} />
                     {doc.metadata_confirmed && (
                       <div className="mt-1 text-xs text-green-700">
@@ -95,11 +106,11 @@ export default async function QueuePage({
                       </div>
                     )}
                   </td>
-                  <td className="py-2 pr-4">{chunkCounts.get(doc.id) ?? 0}</td>
-                  <td className="max-w-xs whitespace-pre-wrap py-2 pr-4 text-red-700">
+                  <td className="px-4 py-3">{chunkCounts.get(doc.id) ?? 0}</td>
+                  <td className="max-w-xs whitespace-pre-wrap px-4 py-3 text-red-700">
                     {doc.error_message ?? ""}
                   </td>
-                  <td className="py-2 pr-4">
+                  <td className="px-4 py-3">
                     <div className="flex flex-col items-start gap-2">
                       {doc.status === "failed" && (
                         <form action={retryDocument}>
