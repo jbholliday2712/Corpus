@@ -260,18 +260,35 @@ click approve. Repeat for every manual we use at work.
       `providers.py` (embed/vision/llm via NIM), `db.py` (Supabase),
       `config.py` (.env loader), `cli.py` stub (check/ingest/watch/retry/status),
       `pipeline/tests/test_chunk.py`.
-- [x] Supabase GitHub integration wired: `supabase/config.toml` +
+- [x] Supabase GitHub integration set up: `supabase/config.toml` +
       `supabase/migrations/20260718000000_initial_schema.sql` (schema moved
-      out of `db/schema.sql`, which no longer exists). Migrations
-      auto-apply to the linked Supabase project on push to `main` — no more
-      manual SQL editor step.
-- [ ] **Not yet done — needs my real credentials, can't be done from this session:**
-  - Fill in `pipeline/.env` with real NIM_API_KEY, NIM_EMBED_MODEL,
-    SUPABASE_URL, SUPABASE_SERVICE_KEY, DATABASE_URL.
-  - Run `corpus check` (from `pipeline/`, after `pip install -e ".[dev]"`) to
-    confirm Supabase connectivity and to print the real embedding dimension.
-  - If the printed dims != 1024, add a follow-up migration altering
-    `vector(1024)` in `chunks.embedding`, push it, and re-check.
+      out of `db/schema.sql`, which no longer exists).
+  - **Unconfirmed:** pushed this migration to `main` and waited ~3 min;
+    it never auto-applied via the integration. Applied it manually instead
+    (direct `psycopg2` connection using `DATABASE_URL`). Before relying on
+    "push = auto-deployed schema", check Project Settings → Integrations →
+    GitHub in the Supabase dashboard to confirm it's actually linked to this
+    repo/branch — it may need a manual link/approval step. Future migrations
+    should go in `supabase/migrations/` either way; fall back to the manual
+    `psycopg2`/`DATABASE_URL` apply if the integration doesn't pick them up.
+- [x] `pipeline/.env` filled in with real credentials and confirmed working
+      via `corpus check`: Supabase reachable, `documents`/`chunks`/`settings`
+      tables exist, NIM embed model `nvidia/nv-embedqa-e5-v5` confirmed at
+      1024 dims (matches `vector(1024)` in the migration — no schema change
+      needed).
+  - Note: `SUPABASE_SERVICE_KEY` must be the **secret** key (`sb_secret_...`
+    or legacy `service_role` JWT), not the `sb_publishable_...` key — the
+    publishable/anon key was pasted in there initially and caused a
+    misleading "table not found in schema cache" error from PostgREST.
+  - Note: local Norton Antivirus does SSL/TLS interception on outbound
+    HTTPS, which broke Python's cert verification for the Supabase and NIM
+    hosts. Fixed by appending Norton's local root CA (pulled from
+    `Cert:\LocalMachine\Root`) to the `certifi` bundle Python uses. This is
+    a machine-local fix, not something in the repo — if this env is ever
+    reset or another machine hits the same error, redo it there too.
+- [ ] **Still needs my input:**
+  - `NIM_VISION_MODEL` / `NIM_LLM_MODEL` are blank — not required for M1,
+    but needed before M3 (vision path) / M4 (metadata inference).
   - Once confirmed, record the model id via `db.set_setting("embedding_model", "<id>")`
     or manually in the `settings` table — this is what the future chat app reads.
 - [ ] M2 not started: extract.py/chunk.py/embed.py are stubs that raise
@@ -284,3 +301,4 @@ click approve. Repeat for every manual we use at work.
 |---|---|---|
 | — | Project planned, STATUS.md created | Begin M1 |
 | 2026-07-17 | M1 skeleton built on `main`: repo layout, `pipeline/` package (config, providers, db, cli stub, intake), `db/schema.sql`, chunk test scaffold. All committed directly to main per new workflow (no per-session branches). Verified `corpus check` degrades gracefully with no `.env`, `pytest` passes. | Fill in real `.env` values, apply schema to Supabase, run `corpus check` to confirm embedding dims, then start M2 (text-path happy path with one clean manual). |
+| 2026-07-18 | M1 finished: moved schema to `supabase/migrations/` + `config.toml` for the GitHub integration; renamed `.env.example` → `.env` and filled in real credentials; fixed local Norton SSL interception breaking Python HTTPS; caught a publishable-key-in-service-key-slot mistake; migration didn't auto-apply via the GitHub integration within ~3 min so applied it manually over `DATABASE_URL`. `corpus check` now fully green (Supabase reachable, tables exist, NIM embed confirms 1024 dims). | Confirm in the Supabase dashboard whether the GitHub integration is actually linked (Project Settings → Integrations → GitHub) so future migrations auto-apply; if not, keep using the manual `DATABASE_URL` apply. Then start M2. |
