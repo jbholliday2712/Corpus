@@ -30,6 +30,13 @@ function requirePipelineEnv(): { pythonBin: string; pipelineDir: string } {
   return { pythonBin, pipelineDir: path.resolve(pipelineDir) };
 }
 
+// work/ is a sibling of pipeline/ per corpus/paths.py (ROOT/work,
+// ROOT/pipeline) — no separate env var needed, just derive it.
+function workDirFor(fileHash: string): string {
+  const { pipelineDir } = requirePipelineEnv();
+  return path.join(pipelineDir, "..", "work", fileHash);
+}
+
 export async function confirmMetadata(formData: FormData): Promise<void> {
   const id = String(formData.get("id"));
   const supabase = getSupabaseAdmin();
@@ -179,4 +186,98 @@ export async function searchChunks(
     chunkId: row.chunk_id,
     similarity: row.similarity,
   }));
+}
+
+export async function getFurnitureReport(fileHash: string) {
+  const reportPath = path.join(workDirFor(fileHash), "furniture.json");
+  try {
+    const raw = await fs.readFile(reportPath, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    // Not cleaned yet (document hasn't reached that stage), or CORPUS_PIPELINE_DIR
+    // points somewhere without filesystem access to work/ — either way, the
+    // Cleaning tab just shows "nothing to show yet" rather than erroring.
+    return null;
+  }
+}
+
+export async function restoreFurnitureLine(formData: FormData): Promise<void> {
+  const id = String(formData.get("id"));
+  const normalizedLine = String(formData.get("normalizedLine"));
+  const { pythonBin, pipelineDir } = requirePipelineEnv();
+
+  // Changes what gets stripped, so this replaces existing chunks (see
+  // corpus restore-furniture) — can take as long as a full re-process on a
+  // vision-heavy document, so it's backgrounded like retry/upload.
+  const child = spawn(
+    pythonBin,
+    ["-m", "corpus.cli", "restore-furniture", id, normalizedLine],
+    { cwd: pipelineDir, detached: true, stdio: "ignore" }
+  );
+  child.unref();
+
+  redirect(`/documents/${id}?tab=cleaning&restoring=1`);
+}
+
+export async function setProceedOverride(formData: FormData): Promise<void> {
+  const id = String(formData.get("id"));
+  const supabase = getSupabaseAdmin();
+
+  const { data: doc, error: fetchError } = await supabase
+    .from("documents")
+    .select("metadata")
+    .eq("id", id)
+    .maybeSingle();
+  if (fetchError) throw new Error(fetchError.message);
+
+  const { error } = await supabase
+    .from("documents")
+    .update({
+      metadata: { ...(doc?.metadata ?? {}), proceed_override: true },
+    })
+    .eq("id", id);
+  if (error) throw new Error(error.message);
+
+  const { pythonBin, pipelineDir } = requirePipelineEnv();
+  // The override alone doesn't chunk/embed anything — retry re-evaluates
+  // the safety-rail decision (now passing) and continues the pipeline.
+  const child = spawn(pythonBin, ["-m", "corpus.cli", "retry", id], {
+    cwd: pipelineDir,
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+
+  redirect(`/documents/${id}?tab=cleaning&restoring=1`);
+}
+
+export async function setChunkRetrievalOverride(
+  formData: FormData
+): Promise<void> {
+  const chunkId = String(formData.get("chunkId"));
+  const documentId = String(formData.get("documentId"));
+  const include = formData.get("include") === "true";
+  const supabase = getSupabaseAdmin();
+
+  const { data: chunkRow, error: fetchError } = await supabase
+    .from("chunks")
+    .select("metadata")
+    .eq("id", chunkId)
+    .maybeSingle();
+  if (fetchError) throw new Error(fetchError.message);
+
+  const nextMetadata = { ...(chunkRow?.metadata ?? {}) };
+  if (include) {
+    nextMetadata.retrieval_override = true;
+  } else {
+    delete nextMetadata.retrieval_override;
+  }
+
+  const { error } = await supabase
+    .from("chunks")
+    .update({ metadata: nextMetadata })
+    .eq("id", chunkId);
+  if (error) throw new Error(error.message);
+
+  revalidatePath(`/documents/${documentId}`);
 }

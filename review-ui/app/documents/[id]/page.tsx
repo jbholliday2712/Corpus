@@ -1,23 +1,51 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getSupabaseAdmin } from "@/lib/supabase";
-import type { ChunkRow, DocumentRow } from "@/lib/types";
-import { approveDocument } from "@/app/actions";
+import type { ChunkRow, DocumentRow, FurnitureReport } from "@/lib/types";
+import {
+  approveDocument,
+  getFurnitureReport,
+  restoreFurnitureLine,
+  setChunkRetrievalOverride,
+  setProceedOverride,
+} from "@/app/actions";
 import { ACTIVE_STATUSES, StatusBadge } from "@/components/StatusBadge";
 import { AutoRefresh } from "@/components/AutoRefresh";
 import { computeDocumentFlags, isChunkFlagged } from "@/lib/flags";
 
 export const dynamic = "force-dynamic";
 
+function sectionType(chunk: ChunkRow): string | null {
+  return (chunk.metadata?.section_type as string | undefined) ?? null;
+}
+
+function isRetrievalOverridden(chunk: ChunkRow): boolean {
+  return Boolean(chunk.metadata?.retrieval_override);
+}
+
+function tabLinkClass(active: boolean): string {
+  return `border-b-2 px-3 py-2 text-sm font-medium ${
+    active
+      ? "border-blue-600 text-blue-700"
+      : "border-transparent text-gray-500 hover:text-gray-700"
+  }`;
+}
+
 export default async function DocumentPage({
   params,
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ uploaded?: string; duplicate?: string }>;
+  searchParams: Promise<{
+    uploaded?: string;
+    duplicate?: string;
+    tab?: string;
+    restoring?: string;
+  }>;
 }) {
   const { id } = await params;
-  const { uploaded, duplicate } = await searchParams;
+  const { uploaded, duplicate, tab, restoring } = await searchParams;
+  const activeTab = tab === "cleaning" ? "cleaning" : "chunks";
   const supabase = getSupabaseAdmin();
 
   const { data: doc, error: docError } = await supabase
@@ -43,6 +71,11 @@ export default async function DocumentPage({
     .order("chunk_index", { ascending: true });
   const typedChunks = (chunks ?? []) as ChunkRow[];
 
+  const cleaningWarning = typedDoc.metadata?.cleaning_warning as
+    | { stripped_pct: number; message: string }
+    | undefined;
+  const proceedOverride = Boolean(typedDoc.metadata?.proceed_override);
+
   const flags = computeDocumentFlags(
     {
       pageCount: typedDoc.page_count,
@@ -50,9 +83,23 @@ export default async function DocumentPage({
       manufacturer: typedDoc.manufacturer,
       revision: typedDoc.revision,
       docType: typedDoc.doc_type,
+      cleaningWarning,
     },
-    typedChunks.map((c) => ({ tokenCount: c.token_count, extractionPath: c.extraction_path }))
+    typedChunks.map((c) => ({
+      tokenCount: c.token_count,
+      extractionPath: c.extraction_path,
+      sectionType: sectionType(c),
+    }))
   );
+
+  const excludedChunks = typedChunks.filter(
+    (c) => sectionType(c) && !isRetrievalOverridden(c)
+  );
+
+  let furnitureReport: FurnitureReport | null = null;
+  if (activeTab === "cleaning") {
+    furnitureReport = await getFurnitureReport(typedDoc.file_hash);
+  }
 
   return (
     <main className="mx-auto max-w-4xl px-8 py-8">
@@ -64,7 +111,7 @@ export default async function DocumentPage({
 
       {uploaded && (
         <p className="mt-4 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-800">
-          Uploaded. Processing (extract → metadata → chunk → embed) is
+          Uploaded. Processing (extract → metadata → clean → chunk → embed) is
           running in the background — this page updates automatically.
         </p>
       )}
@@ -72,6 +119,12 @@ export default async function DocumentPage({
         <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
           This file was already ingested (matching content hash) — showing
           the existing document instead of re-processing it.
+        </p>
+      )}
+      {restoring && (
+        <p className="mt-4 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-800">
+          Running in the background — this page updates automatically once
+          it finishes.
         </p>
       )}
 
@@ -126,53 +179,245 @@ export default async function DocumentPage({
         </p>
       )}
 
+      <div className="mb-6 flex gap-1 border-b border-gray-200">
+        <Link href={`/documents/${id}`} className={tabLinkClass(activeTab === "chunks")}>
+          Chunks
+        </Link>
+        <Link
+          href={`/documents/${id}?tab=cleaning`}
+          className={tabLinkClass(activeTab === "cleaning")}
+        >
+          Cleaning
+          {excludedChunks.length > 0 && (
+            <span className="ml-1.5 rounded-full bg-gray-200 px-1.5 py-0.5 text-xs text-gray-700">
+              {excludedChunks.length}
+            </span>
+          )}
+        </Link>
+      </div>
+
       {chunksError && (
         <p className="text-red-600">Failed to load chunks: {chunksError.message}</p>
       )}
 
-      <div className="flex flex-col gap-4">
-        {typedChunks.map((chunk) => {
-          const flagged = isChunkFlagged(chunk.token_count);
-          return (
-            <article
-              key={chunk.id}
-              id={`chunk-${chunk.id}`}
-              className={`scroll-mt-4 rounded-lg border bg-white p-4 shadow-sm ${
-                flagged ? "border-amber-300 ring-1 ring-amber-200" : "border-gray-200"
-              }`}
-            >
-              <div className="mb-2 flex flex-wrap items-center gap-3 text-xs text-gray-500">
-                <span>#{chunk.chunk_index}</span>
-                <span>
-                  pages {chunk.page_start ?? "?"}&ndash;{chunk.page_end ?? "?"}
-                </span>
-                {chunk.section && <span>section: {chunk.section}</span>}
-                <span
-                  className={
-                    chunk.extraction_path === "vision" ? "font-medium text-purple-700" : ""
-                  }
-                >
-                  {chunk.extraction_path ?? "text"}
-                </span>
-                <span>{chunk.token_count ?? "?"} tokens</span>
-                {flagged && (
-                  <span className="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-800">
-                    ⚠ short chunk
+      {activeTab === "chunks" ? (
+        <div className="flex flex-col gap-4">
+          {typedChunks.map((chunk) => {
+            const flagged = isChunkFlagged(chunk.token_count);
+            const type = sectionType(chunk);
+            const excluded = Boolean(type) && !isRetrievalOverridden(chunk);
+            return (
+              <article
+                key={chunk.id}
+                id={`chunk-${chunk.id}`}
+                className={`scroll-mt-4 rounded-lg border p-4 shadow-sm ${
+                  excluded
+                    ? "border-gray-200 bg-gray-50"
+                    : flagged
+                      ? "border-amber-300 bg-white ring-1 ring-amber-200"
+                      : "border-gray-200 bg-white"
+                }`}
+              >
+                <div className="mb-2 flex flex-wrap items-center gap-3 text-xs text-gray-500">
+                  <span>#{chunk.chunk_index}</span>
+                  <span>
+                    pages {chunk.page_start ?? "?"}&ndash;{chunk.page_end ?? "?"}
                   </span>
-                )}
+                  {chunk.section && <span>section: {chunk.section}</span>}
+                  <span
+                    className={
+                      chunk.extraction_path === "vision" ? "font-medium text-purple-700" : ""
+                    }
+                  >
+                    {chunk.extraction_path ?? "text"}
+                  </span>
+                  <span>{chunk.token_count ?? "?"} tokens</span>
+                  {flagged && !excluded && (
+                    <span className="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-800">
+                      ⚠ short chunk
+                    </span>
+                  )}
+                  {type && (
+                    <span className="rounded bg-gray-200 px-1.5 py-0.5 font-medium text-gray-700">
+                      {type}
+                      {!excluded && " (included)"}
+                      {excluded && " — excluded from retrieval"}
+                    </span>
+                  )}
+                </div>
+                <pre
+                  className={`whitespace-pre-wrap break-words font-mono text-sm ${
+                    excluded ? "text-gray-500" : ""
+                  }`}
+                >
+                  {chunk.content}
+                </pre>
+              </article>
+            );
+          })}
+          {typedChunks.length === 0 && (
+            <p className="rounded-lg border border-dashed border-gray-300 bg-white p-6 text-center text-gray-500">
+              No chunks yet.
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-8">
+          {cleaningWarning && (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+              <p className="mb-2 font-medium">Cleaning safety rail triggered</p>
+              <p className="mb-3">{cleaningWarning.message}</p>
+              {!proceedOverride && (
+                <form action={setProceedOverride}>
+                  <input type="hidden" name="id" value={typedDoc.id} />
+                  <button
+                    type="submit"
+                    className="rounded bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700"
+                  >
+                    Proceed anyway (chunk &amp; embed as cleaned)
+                  </button>
+                </form>
+              )}
+              {proceedOverride && (
+                <p className="text-xs text-red-700">
+                  Proceed override is set — re-run <code>corpus retry</code> (or wait for
+                  the background run this may have already triggered) to continue.
+                </p>
+              )}
+            </div>
+          )}
+
+          <section>
+            <h2 className="mb-2 text-lg font-semibold text-gray-900">
+              Furniture stripped from this document
+            </h2>
+            {!furnitureReport ? (
+              <p className="text-sm text-gray-500">
+                No cleaning report yet — this document hasn&apos;t reached the cleaning
+                stage.
+              </p>
+            ) : furnitureReport.furniture.length === 0 ? (
+              <p className="text-sm text-gray-500">
+                Nothing was stripped ({furnitureReport.total_lines} lines scanned across{" "}
+                {furnitureReport.total_pages} pages).
+              </p>
+            ) : (
+              <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white shadow-sm">
+                <p className="border-b border-gray-100 px-4 py-2 text-xs text-gray-500">
+                  {furnitureReport.stripped_lines}/{furnitureReport.total_lines} lines
+                  stripped ({furnitureReport.stripped_pct}%) — a line needed to repeat on
+                  at least {furnitureReport.threshold_pages} pages to be flagged.
+                </p>
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-200 bg-gray-50 text-left text-xs font-medium tracking-wide text-gray-500 uppercase">
+                      <th className="px-4 py-2">Line</th>
+                      <th className="px-4 py-2">Pages</th>
+                      <th className="px-4 py-2">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {furnitureReport.furniture.map((entry) => (
+                      <tr key={entry.normalized} className="border-b border-gray-100 last:border-b-0">
+                        <td className="px-4 py-2 font-mono text-xs text-gray-800">
+                          {entry.example_lines[0] ?? entry.normalized}
+                        </td>
+                        <td className="px-4 py-2 text-xs text-gray-500">
+                          {entry.page_count} pages (e.g. {entry.example_pages.join(", ")})
+                        </td>
+                        <td className="px-4 py-2">
+                          <form action={restoreFurnitureLine}>
+                            <input type="hidden" name="id" value={typedDoc.id} />
+                            <input
+                              type="hidden"
+                              name="normalizedLine"
+                              value={entry.normalized}
+                            />
+                            <button
+                              type="submit"
+                              className="rounded bg-gray-700 px-2 py-1 text-xs text-white hover:bg-gray-800"
+                            >
+                              Restore
+                            </button>
+                          </form>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-              <pre className="whitespace-pre-wrap break-words font-mono text-sm">
-                {chunk.content}
-              </pre>
-            </article>
-          );
-        })}
-        {typedChunks.length === 0 && (
-          <p className="rounded-lg border border-dashed border-gray-300 bg-white p-6 text-center text-gray-500">
-            No chunks yet.
-          </p>
-        )}
-      </div>
+            )}
+          </section>
+
+          <section>
+            <h2 className="mb-2 text-lg font-semibold text-gray-900">
+              Structural &amp; runt chunks
+            </h2>
+            <p className="mb-3 text-sm text-gray-500">
+              TOC/index/revision-history pages (structural) and near-empty
+              chunks with no same-section neighbour to merge into (runt) are
+              excluded from similarity search by default — not deleted.
+              Toggle a chunk back in if that&apos;s wrong for this document.
+            </p>
+            {typedChunks.filter((c) => sectionType(c)).length === 0 ? (
+              <p className="text-sm text-gray-500">
+                No structural or runt chunks in this document.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {typedChunks
+                  .filter((c) => sectionType(c))
+                  .map((c) => {
+                    const included = isRetrievalOverridden(c);
+                    return (
+                      <div
+                        key={c.id}
+                        className="flex items-start justify-between gap-3 rounded-lg border border-gray-200 bg-white p-3"
+                      >
+                        <div className="min-w-0">
+                          <div className="mb-1 flex flex-wrap gap-2 text-xs text-gray-500">
+                            <span>#{c.chunk_index}</span>
+                            <span>
+                              pages {c.page_start ?? "?"}&ndash;{c.page_end ?? "?"}
+                            </span>
+                            <span className="rounded bg-gray-200 px-1.5 py-0.5 font-medium text-gray-700">
+                              {sectionType(c)}
+                            </span>
+                            {included && (
+                              <span className="rounded bg-emerald-100 px-1.5 py-0.5 font-medium text-emerald-800">
+                                included in retrieval
+                              </span>
+                            )}
+                          </div>
+                          <p className="line-clamp-2 text-sm text-gray-600">{c.content}</p>
+                        </div>
+                        <form action={setChunkRetrievalOverride} className="shrink-0">
+                          <input type="hidden" name="chunkId" value={c.id} />
+                          <input type="hidden" name="documentId" value={typedDoc.id} />
+                          <input
+                            type="hidden"
+                            name="include"
+                            value={included ? "false" : "true"}
+                          />
+                          <button
+                            type="submit"
+                            className={`rounded px-2 py-1 text-xs font-medium ${
+                              included
+                                ? "bg-gray-200 text-gray-700 hover:bg-gray-300"
+                                : "bg-emerald-600 text-white hover:bg-emerald-700"
+                            }`}
+                          >
+                            {included ? "Exclude again" : "Include in retrieval"}
+                          </button>
+                        </form>
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
     </main>
   );
 }

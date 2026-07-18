@@ -3,8 +3,8 @@ token overlap. Tables and numbered procedures are treated as atomic blocks
 that never get split across a chunk boundary.
 
 `chunk_pages` is the pure, DB-free algorithm — the thing worth unit-testing.
-`chunk_document` is the thin I/O wrapper that reads work/<hash>/pages/*.md
-and writes rows to `chunks`.
+`chunk_document` is the thin I/O wrapper that reads work/<hash>/cleaned/pages/*.md
+(written by clean.py) and writes rows to `chunks`.
 """
 
 import re
@@ -12,6 +12,9 @@ from dataclasses import dataclass
 
 DEFAULT_MAX_TOKENS = 1000
 DEFAULT_OVERLAP_TOKENS = 100
+RUNT_TOKEN_THRESHOLD = 50  # STATUS.md cleaning-stage rule: chunks below this
+# get merged into the previous same-section chunk, or tagged section_type='runt'
+# and excluded from retrieval — never deleted.
 
 _TABLE_LINE_RE = re.compile(r"\|")
 _PROCEDURE_LINE_RE = re.compile(r"^\s*\d+[.)]\s+\S")
@@ -31,9 +34,13 @@ class Block:
     page_end: int
     kind: str  # 'heading' | 'table' | 'procedure' | 'text'
     extraction_path: str = "text"  # 'text' | 'vision' — the page(s) it came from
+    structural: bool = False  # the page(s) it came from were TOC/index/revision-history
 
 
-def _is_table(lines: list[str]) -> bool:
+def is_table_block(lines: list[str]) -> bool:
+    """Public: reused by clean.py to exempt table lines from furniture
+    stripping (a repeated table header row must never be treated as a
+    page-footer-style repeated line)."""
     if len(lines) < 2:
         return False
     hits = sum(1 for line in lines if _TABLE_LINE_RE.search(line))
@@ -55,7 +62,9 @@ def _is_heading(para: str, lines: list[str]) -> bool:
     return True
 
 
-def _split_page_into_blocks(page_num: int, text: str, extraction_path: str) -> list[Block]:
+def _split_page_into_blocks(
+    page_num: int, text: str, extraction_path: str, structural: bool
+) -> list[Block]:
     blocks = []
     for para in re.split(r"\n\s*\n", text.strip()):
         para = para.strip()
@@ -64,7 +73,7 @@ def _split_page_into_blocks(page_num: int, text: str, extraction_path: str) -> l
         lines = [line for line in para.splitlines() if line.strip()]
         if not lines:
             continue
-        if _is_table(lines):
+        if is_table_block(lines):
             kind = "table"
         elif _is_procedure(lines):
             kind = "procedure"
@@ -79,6 +88,7 @@ def _split_page_into_blocks(page_num: int, text: str, extraction_path: str) -> l
                 page_end=page_num,
                 kind=kind,
                 extraction_path=extraction_path,
+                structural=structural,
             )
         )
     return blocks
@@ -101,6 +111,7 @@ def _merge_adjacent_atomic(blocks: list[Block]) -> list[Block]:
                 page_end=block.page_end,
                 kind=block.kind,
                 extraction_path=_combine_path(prev.extraction_path, block.extraction_path),
+                structural=prev.structural or block.structural,
             )
         else:
             merged.append(block)
@@ -121,6 +132,9 @@ def _take_overlap(blocks: list[Block], overlap_tokens: int) -> list[Block]:
 def _finalize(blocks: list[Block], section: str | None) -> dict:
     content = "\n\n".join(b.text for b in blocks)
     extraction_path = "text" if all(b.extraction_path == "text" for b in blocks) else "vision"
+    metadata: dict = {}
+    if any(b.structural for b in blocks):
+        metadata["section_type"] = "structural"
     return {
         "content": content,
         "page_start": min(b.page_start for b in blocks),
@@ -128,6 +142,7 @@ def _finalize(blocks: list[Block], section: str | None) -> dict:
         "section": section,
         "extraction_path": extraction_path,
         "token_count": estimate_tokens(content),
+        "metadata": metadata,
     }
 
 
@@ -172,21 +187,87 @@ def _pack_blocks(
     return result
 
 
+def apply_runt_handling(chunks: list[dict]) -> list[dict]:
+    """Any chunk under RUNT_TOKEN_THRESHOLD tokens is merged into the
+    previous chunk if they share the same `section`, otherwise tagged
+    metadata.section_type='runt' — never deleted, per the cleaning stage's
+    NON-DESTRUCTIVE rule. Chunks already tagged (e.g. 'structural' by
+    _finalize) are left alone here, both as merge sources and as merge
+    targets: they're already excluded from retrieval, and merging unrelated
+    content into/out of an already-classified chunk would blur why it was
+    classified that way. Re-numbers chunk_index at the end since merges
+    change the count."""
+    result: list[dict] = []
+    for chunk in chunks:
+        tagged = bool(chunk.get("metadata", {}).get("section_type"))
+        is_runt = chunk["token_count"] < RUNT_TOKEN_THRESHOLD and not tagged
+
+        prev = result[-1] if result else None
+        # 'structural' chunks come from a categorically different source
+        # (a TOC/index page) and must not absorb unrelated runt content —
+        # but a chunk already tagged 'runt' by an earlier iteration of this
+        # same loop IS a valid merge target, so consecutive tiny
+        # same-section chunks cascade into one instead of each becoming its
+        # own isolated runt.
+        prev_mergeable = (
+            prev is not None
+            and prev.get("metadata", {}).get("section_type") != "structural"
+            and prev["section"] == chunk["section"]
+        )
+
+        if is_runt and prev_mergeable:
+            merged_content = prev["content"] + "\n\n" + chunk["content"]
+            new_token_count = estimate_tokens(merged_content)
+            prev["content"] = merged_content
+            prev["token_count"] = new_token_count
+            prev["page_end"] = max(prev["page_end"], chunk["page_end"])
+            prev["extraction_path"] = _combine_path(
+                prev["extraction_path"], chunk["extraction_path"]
+            )
+            if new_token_count >= RUNT_TOKEN_THRESHOLD:
+                # grew past the threshold via merging — no longer a runt
+                prev["metadata"] = {
+                    k: v for k, v in prev.get("metadata", {}).items() if k != "section_type"
+                }
+            continue
+
+        if is_runt:
+            chunk = {
+                **chunk,
+                "metadata": {**chunk.get("metadata", {}), "section_type": "runt"},
+            }
+
+        result.append(chunk)
+
+    for i, c in enumerate(result):
+        c["chunk_index"] = i
+    return result
+
+
 def chunk_pages(
     pages: list[dict],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
 ) -> list[dict]:
-    """pages: [{"page": int, "text": str, "extraction_path": "text"|"vision"}, ...]
-    in reading order ("extraction_path" defaults to "text" if omitted).
+    """pages: [{"page": int, "text": str, "extraction_path": "text"|"vision",
+    "structural": bool}, ...] in reading order ("extraction_path" defaults
+    to "text", "structural" to False, if omitted).
     Returns chunk dicts with chunk_index/content/page_start/page_end/section/
-    extraction_path/token_count, ready to insert (minus document_id). A
-    chunk's extraction_path is "vision" if any page it draws from was."""
+    extraction_path/token_count/metadata, ready to insert (minus
+    document_id). A chunk's extraction_path is "vision" if any page it
+    draws from was; metadata.section_type is "structural" if any page it
+    draws from was flagged structural (TOC/index/revision-history) by
+    clean.py. Runt handling (merge/tag chunks under 50 tokens) is a
+    separate pass — see apply_runt_handling — not applied here, so this
+    function stays a pure "pack blocks into chunks" step."""
     all_blocks: list[Block] = []
     for page in pages:
         all_blocks.extend(
             _split_page_into_blocks(
-                page["page"], page["text"], page.get("extraction_path", "text")
+                page["page"],
+                page["text"],
+                page.get("extraction_path", "text"),
+                page.get("structural", False),
             )
         )
     all_blocks = _merge_adjacent_atomic(all_blocks)
@@ -199,7 +280,7 @@ def chunk_pages(
 
 def chunk_document(document_id: str) -> int:
     from corpus import db
-    from corpus.extract import read_page
+    from corpus.clean import read_cleaned_page
     from corpus.paths import WORK_DIR
 
     doc_row = db.get_document(document_id)
@@ -215,17 +296,25 @@ def chunk_document(document_id: str) -> int:
         db.update_document(document_id, {"status": "chunking"})
         return existing
 
-    pages_dir = WORK_DIR / doc_row["file_hash"] / "pages"
+    pages_dir = WORK_DIR / doc_row["file_hash"] / "cleaned" / "pages"
     page_paths = sorted(pages_dir.glob("*.md"))
     if not page_paths:
-        raise FileNotFoundError(f"no extracted pages in {pages_dir} (run extract first)")
+        raise FileNotFoundError(f"no cleaned pages in {pages_dir} (run clean first)")
 
     pages = []
     for p in page_paths:
-        extraction_path, text = read_page(p)
-        pages.append({"page": int(p.stem), "text": text, "extraction_path": extraction_path})
+        extraction_path, structural, text = read_cleaned_page(p)
+        pages.append(
+            {
+                "page": int(p.stem),
+                "text": text,
+                "extraction_path": extraction_path,
+                "structural": structural,
+            }
+        )
 
     chunks = chunk_pages(pages)
+    chunks = apply_runt_handling(chunks)
     if chunks:
         rows = [{**c, "document_id": document_id} for c in chunks]
         db.insert_chunks(rows)

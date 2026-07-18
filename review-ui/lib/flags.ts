@@ -15,6 +15,7 @@ const PROSE_FIELD_MAX_CHARS = 40;
 export interface ChunkStat {
   tokenCount: number | null;
   extractionPath: string | null;
+  sectionType?: string | null;
 }
 
 export interface DocumentForFlagging {
@@ -23,6 +24,7 @@ export interface DocumentForFlagging {
   manufacturer: string | null;
   revision: string | null;
   docType: string | null;
+  cleaningWarning?: { stripped_pct: number } | null;
 }
 
 export interface DocumentFlag {
@@ -50,10 +52,24 @@ export function computeDocumentFlags(
 ): DocumentFlag[] {
   const flags: DocumentFlag[] = [];
   const isProcessed = doc.status === "review" || doc.status === "done";
+
+  if (doc.cleaningWarning) {
+    flags.push({
+      key: "cleaning-safety-rail",
+      severity: "critical",
+      label: `${doc.cleaningWarning.stripped_pct}% of lines were stripped as furniture during cleaning — stopped before chunking/embedding, check the Cleaning tab.`,
+    });
+  }
   const chunkCount = chunks.length;
   const visionCount = chunks.filter((c) => c.extractionPath === "vision").length;
   const totalTokens = chunks.reduce((sum, c) => sum + (c.tokenCount ?? 0), 0);
-  const shortChunkCount = chunks.filter((c) => isChunkFlagged(c.tokenCount)).length;
+  // Chunks already tagged structural/runt by the cleaning stage are handled
+  // (visible, actionable in the Cleaning tab) — flagging them again here
+  // would just be duplicate noise. Only count short chunks the pipeline
+  // *didn't* already catch and tag.
+  const shortChunkCount = chunks.filter(
+    (c) => isChunkFlagged(c.tokenCount) && !c.sectionType
+  ).length;
 
   if (isProcessed && (doc.pageCount ?? 0) > 0 && chunkCount === 0) {
     flags.push({

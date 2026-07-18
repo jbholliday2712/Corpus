@@ -61,6 +61,10 @@ create table documents (
   -- queued | extracting | chunking | embedding | review | done | failed
   error_message text,                        -- populated when status = failed
   metadata_confirmed boolean default false,  -- true after I approve inferred metadata
+  metadata      jsonb default '{}',          -- added in the cleaning-stage migration: non-fatal
+                                              -- structured flags, e.g. {"cleaning_warning": {...}}
+                                              -- when the >15%-stripped safety rail trips, or
+                                              -- {"proceed_override": true} once a human clicks past it
   created_at    timestamptz default now(),
   updated_at    timestamptz default now()
 );
@@ -76,6 +80,12 @@ create table chunks (
   extraction_path text,                      -- 'text' | 'vision'
   token_count   int,
   metadata      jsonb default '{}',
+  -- metadata->>'section_type': 'structural' (TOC/index/revision-history
+  -- page) | 'runt' (<50 tokens, no same-section chunk to merge into) | unset
+  -- for a normal chunk. metadata->>'retrieval_override' = 'true': a human
+  -- explicitly re-included a structural/runt chunk via the Cleaning tab.
+  -- See §9 — structural/runt chunks (without an override) MUST be excluded
+  -- from similarity search.
   embedding     vector(1024),                -- match NIM embed model dims; CHECK ACTUAL DIMS FIRST
   created_at    timestamptz default now()
 );
@@ -126,15 +136,58 @@ speed doesn't matter.
 - Store on the document row. `metadata_confirmed = false` until I approve in
   the review UI (one-click confirm/edit).
 
+### Stage 2.5 — Cleaning
+NON-DESTRUCTIVE: raw per-page markdown in `./work/<hash>/pages/` (written by
+Stage 1) is never modified. This stage reads it and writes
+`./work/<hash>/cleaned/pages/` plus `./work/<hash>/furniture.json`; a failed
+or over-aggressive clean never loses the original extraction.
+
+1. **Furniture stripping** (deterministic, per document): normalise each
+   line (collapse whitespace, digit runs → `#`) and count how many distinct
+   pages it appears on. A line on ≥30% of pages (min 5 pages) is furniture
+   (headers/footers/"Page X of Y"/running title) and is removed from the
+   cleaned copy only. Exceptions, none of which are ever stripped regardless
+   of repetition: lines inside a markdown table, lines >80 chars, and lines
+   matching `/warning|caution|danger|note:/i` — a safety notice repeated on
+   every page must never be silently dropped, even with the restore toggle
+   available as a safety net (fire/security panel manuals specifically).
+   `furniture.json` records every stripped line, its page count, and 2
+   example pages.
+2. **Structural page/chunk tagging** (not deletion): a page is TOC/index/
+   revision-history if it has a heading matching
+   `/^(contents|index|revision|document history)/i`, or if ≥50% of its lines
+   look like TOC entries (dot leaders or a wide gap before a trailing page
+   number). These pages still get chunked downstream (Stage 3), but their
+   chunks get `metadata->>'section_type' = 'structural'` and — per §9 — MUST
+   be excluded from similarity search.
+3. **Runt handling** (applied after Stage 3 packs chunks): any chunk under
+   50 tokens is merged into the previous chunk if they share the same
+   `section` (cascades — several tiny same-section chunks in a row combine
+   into one, and the merge tag clears if the combined size crosses 50
+   tokens), otherwise tagged `metadata->>'section_type' = 'runt'`. Never
+   deleted. A chunk already tagged `'structural'` is never a merge source or
+   target, so unrelated content doesn't blur into a TOC-page chunk.
+4. **Safety rail**: log total lines / lines stripped / % stripped per
+   document. If >15% stripped, set `status = 'review'` with
+   `documents.metadata.cleaning_warning` instead of proceeding to Stage 3/4
+   automatically — that ratio means the heuristic likely misfired. A human
+   can restore specific furniture lines (Cleaning tab, forces
+   re-clean → re-chunk → re-embed via `corpus restore-furniture`) or click
+   "proceed anyway" (`documents.metadata.proceed_override`, re-evaluated by
+   `corpus retry` without needing to re-clean).
+
 ### Stage 3 — Chunking (`extracting → chunking`)
-- Concatenate page markdowns with page markers.
+- Reads `./work/<hash>/cleaned/pages/` (not raw `pages/`).
 - Split on headings first, then pack sections into chunks of ~500–1000 tokens
   with ~100 token overlap.
 - **Never split a markdown table or a numbered procedure across chunks.** If a
   table alone exceeds the max size, it becomes its own oversized chunk —
   oversized and intact beats split and useless.
 - Record `page_start`/`page_end` per chunk (from page markers) and nearest
-  heading as `section`.
+  heading as `section`. A chunk's `metadata->>'section_type'` is
+  `'structural'` if any source page was tagged structural in Stage 2.5.
+- Apply Stage 2.5's runt handling (merge/tag chunks under 50 tokens) as a
+  post-processing pass before insert.
 - Insert chunk rows WITHOUT embeddings yet.
 
 ### Stage 4 — Embedding (`chunking → embedding`)
@@ -152,6 +205,12 @@ speed doesn't matter.
 - Any unhandled exception: set status `failed`, write `error_message`, move on
   to the next document. Never let one bad PDF kill the queue.
 - CLI command `corpus retry <id>` re-runs from the failed stage.
+- CLI command `corpus restore-furniture <id> <normalized_line>` is a
+  targeted variant of retry for the Cleaning stage specifically: exempts one
+  furniture line for this document going forward and forces a
+  re-clean → re-chunk → re-embed (unlike `retry`, it always regenerates the
+  cleaned pages and always replaces existing chunks, since the cleaned text
+  itself changed).
 
 ---
 
@@ -165,9 +224,19 @@ Pages:
    range, section, extraction path, token count per chunk. This is the
    inspection hatch: I check tables survived and sections make sense.
    Approve button sets `done`.
+3. **Cleaning tab** (on the document view): the furniture lines removed for
+   this document (from `furniture.json`) with a per-line "Restore" button
+   (triggers `corpus restore-furniture`); every structural/runt chunk,
+   greyed out, with an "Include in retrieval" toggle (sets/clears
+   `chunks.metadata.retrieval_override`); if the >15%-stripped safety rail
+   tripped, a warning plus a "Proceed anyway" button
+   (`documents.metadata.proceed_override`).
 
 No auth (local only). Plain Tailwind, no design effort needed — function over
-form here.
+form here. (In practice the queue/document views grew a fair bit past
+"no design effort" once real use surfaced that bare tables weren't
+user-friendly — see §10/§11 for what actually shipped: upload, a chunk
+similarity graph, search, automatic flagging, and now the Cleaning tab.)
 
 ---
 
@@ -182,21 +251,30 @@ corpus/
 ├── pipeline/              ← Python
 │   ├── pyproject.toml
 │   ├── corpus/
-│   │   ├── cli.py         ← entrypoints: ingest, watch, retry, status
+│   │   ├── cli.py         ← entrypoints: ingest, watch, retry,
+│   │   │                     restore-furniture, embed-query, status
 │   │   ├── intake.py
 │   │   ├── extract.py     ← triage + PyMuPDF + vision path
 │   │   ├── metadata.py
-│   │   ├── chunk.py
+│   │   ├── clean.py       ← furniture stripping, structural tagging,
+│   │   │                     safety rail (Stage 2.5)
+│   │   ├── chunk.py       ← packing + runt handling
 │   │   ├── embed.py
 │   │   ├── providers.py   ← ALL NIM calls live here (embed/vision/llm)
 │   │   ├── db.py          ← Supabase/Postgres access
 │   │   └── config.py      ← reads .env
 │   └── tests/
-│       └── test_chunk.py  ← chunking is the one thing worth unit-testing
+│       ├── test_chunk.py
+│       └── test_clean.py  ← the furniture detector is the other thing
+│                             worth unit-testing
 ├── review-ui/             ← Next.js app (App Router)
 ├── inbox/                 ← drop PDFs here (gitignored)
 ├── store/                 ← content-addressed PDF copies (gitignored)
-└── work/                  ← per-doc intermediate markdown (gitignored)
+└── work/<hash>/            ← per-doc intermediate markdown (gitignored)
+    ├── pages/NNN.md            ← raw extraction (Stage 1), never modified
+    ├── cleaned/pages/NNN.md    ← Stage 2.5 output, what Stage 3 reads
+    ├── furniture.json          ← what Stage 2.5 stripped + why
+    └── furniture_overrides.json ← lines a human restored via the Cleaning tab
 ```
 
 ---
@@ -251,6 +329,25 @@ click approve. Repeat for every manual we use at work.
 - This tool never generates certificates or compliance documents. Advisory
   output only, always cited. (Chat-app concern, but it shapes what metadata
   we keep: page numbers are mandatory on every chunk.)
+- **Structural and runt chunks must be excluded from similarity search.**
+  Chunks tagged `metadata->>'section_type' = 'structural'` (TOC/index/
+  revision-history pages) or `'runt'` (<50 tokens, no same-section chunk to
+  merge into — see §4 Stage 2.5) are chunked and embedded like any other
+  chunk, but the future chat app's retrieval query MUST filter them out
+  unless `metadata->>'retrieval_override' = 'true'` (a human explicitly
+  re-included one via the review UI's Cleaning tab). review-ui's own
+  chunk-graph/search features (`chunk_similarity_edges`, `search_chunks` —
+  see supabase/migrations) already apply this same filter, since they're an
+  explicit preview of that future retrieval behaviour — keep any future
+  retrieval-adjacent code consistent with it.
+- **Safety-critical repeated text is never auto-stripped as furniture.**
+  Lines matching `/warning|caution|danger|note:/i` are exempt from the
+  furniture heuristic regardless of how many pages they repeat on — decided
+  when building the cleaning stage: a page footer being wrongly stripped is
+  a UX papercut with a restore toggle as the safety net, but a real safety
+  notice silently missing from a fire/security panel manual is a different
+  category of risk, and shouldn't rely on a human noticing it's gone from
+  `furniture.json`.
 
 ---
 
@@ -866,6 +963,119 @@ click approve. Repeat for every manual we use at work.
      to look for.
   6. Once confirmed, keep loading the real corpus (M6) — flag anything
      that still trips you up.
+- [x] **Cleaning stage added** (new pipeline stage between extraction and
+      chunking, per explicit spec — see §4 Stage 2.5, §9 for the two
+      decisions it required). Built on `main` (sandbox again has no real
+      Supabase/NIM — verified with pure-function tests + monkeypatched-DB
+      integration scripts, not real data):
+  - `pipeline/corpus/clean.py`: `detect_furniture`/`is_structural_page`/
+    `clean_pages` are pure, DB-free (the actual unit-test surface);
+    `clean_document` is the I/O wrapper (reads `pages/`, writes
+    `cleaned/pages/` + `furniture.json`, enforces the safety rail). Reused
+    `chunk.py`'s table-detection heuristic (made public as `is_table_block`)
+    so "is this line in a table" agrees between cleaning and chunking.
+  - `chunk.py`: reads from `cleaned/pages/` now, not raw `pages/`. Added
+    `apply_runt_handling` (merge/tag <50-token chunks) as a post-processing
+    pass, and threaded a `structural` flag through `Block`/`_finalize`
+    alongside the existing `extraction_path` combination pattern.
+  - `db.py`: added `delete_chunks` (used by `restore-furniture`, which
+    replaces rather than skips existing chunks since the cleaned text
+    itself changes).
+  - `cli.py`: `_process` now runs extract → metadata → **clean** → chunk →
+    embed, stopping before chunk/embed if cleaning's safety rail tripped
+    (checks `report["safety_rail_triggered"]`, verified with monkeypatched
+    stage functions that `chunk_document`/`embed_document` are genuinely
+    never called in that case, and genuinely *are* called in the normal
+    case). New `corpus restore-furniture <id> <line>` command.
+  - `supabase/migrations/..._cleaning_stage.sql`: `documents.metadata`
+    column (mirrors `chunks.metadata`); `chunk_similarity_edges` and
+    `search_chunks` updated to exclude structural/runt chunks (respecting
+    `retrieval_override`), keeping review-ui's graph/search consistent with
+    the new "must exclude from similarity search" rule from §9.
+  - **Two real bugs found and fixed while building/testing this, not
+    shipped broken:**
+    1. My first `apply_runt_handling` excluded *any* already-tagged chunk
+       as a merge target, including ones tagged `'runt'` by an earlier
+       iteration of the same pass — this broke cascading merges (three
+       consecutive tiny same-section chunks became three isolated
+       `'runt'`-tagged chunks instead of merging into one). Caught by an
+       ad hoc script before it ever reached a pytest file; fixed by only
+       excluding `'structural'` chunks as merge targets, and re-evaluating
+       (clearing) the `'runt'` tag if a merge pushes the combined chunk
+       back over the 50-token threshold.
+    2. My first pass at `clean_pages` rejoined a page's kept lines with a
+       flat `"\n".join()`, losing the blank-line paragraph boundaries
+       between blocks — would have silently broken `chunk.py`'s
+       paragraph-based splitting on every cleaned document. Caught by a
+       dedicated test (`test_paragraph_structure_is_preserved_after_stripping`)
+       before it was wired into `chunk_document` at all; fixed by rebuilding
+       cleaned text block-by-block (`"\n\n".join` between blocks,
+       `"\n".join` within one), matching the original paragraph structure
+       exactly minus the stripped lines.
+  - Also hit and fixed several of my own **test-fixture** bugs (not logic
+    bugs) while writing `test_clean.py`: synthetic "body text" built by
+    templating a changing page number into otherwise-identical sentences
+    is itself repetitive enough after normalisation to register as
+    furniture, contaminating several "this should NOT be flagged" control
+    assertions. Fixed by using genuinely distinct sentences per page
+    instead of a number-substitution template — worth remembering for any
+    future furniture-detector tests.
+  - `tests/test_clean.py` (14 tests: repeated footer detected + stripped,
+    repeated table row never stripped, repeated safety-warning line never
+    stripped even though it'd otherwise qualify, coincidental low-frequency
+    repetition not flagged, >80-char lines never flagged, documents under 5
+    pages never flag anything, threshold formula, structural-page detection
+    x3, structural flag propagation, restore-override exemption, paragraph
+    structure preservation) + 10 new tests in `test_chunk.py` for
+    `apply_runt_handling` and structural metadata propagation. 65/65 passing
+    pipeline-wide.
+  - Integration-verified (monkeypatched `db`, synthetic multi-page
+    documents, no real Supabase/NIM) three end-to-end scenarios: realistic
+    document with a footer + TOC page (footer stripped, TOC tagged
+    structural, safety rail correctly does *not* block chunking); sparse
+    document where the footer dominates (safety rail correctly trips,
+    `status=review` + warning, zero chunks ever created); and
+    `proceed_override` correctly unsticking a previously-flagged document
+    on re-evaluation without needing to regenerate cleaned files.
+  - review-ui: new "Cleaning" tab (`?tab=cleaning`) on the document page —
+    furniture lines with per-line Restore buttons (shells out to
+    `restore-furniture`, backgrounded like retry/upload), structural/runt
+    chunks with an "Include in retrieval" toggle (direct JSONB metadata
+    merge, no re-processing needed), and a safety-rail warning banner with
+    "Proceed anyway" when applicable. Chunks tab now badges structural/runt
+    chunks inline (greyed out) too, not just in the dedicated tab. Queue
+    view's flag system (`lib/flags.ts`) updated: the existing "short chunk"
+    flag now excludes chunks the new pipeline already tagged/handled (no
+    double-counting), and a new critical flag surfaces the cleaning safety
+    rail directly in the queue table, not just on the document page.
+  - `tsc --noEmit` clean, `next build` succeeds across all four routes
+    (still `/`, `/documents/[id]`, `/graph` — no new route), `next dev`
+    still serves them with the expected clean credentials-missing error.
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`. `cd pipeline && pip install -e ".[dev]"` (no new deps,
+     but reinstall is cheap and safe), `pytest` → expect 65 passed.
+  2. Apply the new `cleaning_stage` migration (adds `documents.metadata`,
+     updates the two RPC functions) the same way prior migrations were
+     applied.
+  3. `cd review-ui && npm install` (no new deps here either), `npm run dev`.
+  4. Run a real document through `corpus watch`/`ingest`+`process` and
+     check: does `furniture.json` (or the Cleaning tab) list plausible
+     header/footer lines, or is it too aggressive/not aggressive enough?
+     Does a real TOC page in one of the actual manuals get tagged
+     structural? Any real safety-warning line that repeats across pages —
+     confirm it survives (check the Cleaning tab does *not* list it, and
+     that it's genuinely present in the chunked content).
+  5. If a document trips the >15% safety rail on real content, that's the
+     first real test of whether 15% is the right threshold — worth noting
+     whether it was a correct catch (heuristic genuinely misfired) or a
+     false alarm (revisit the threshold/exceptions if so).
+  6. Try the Cleaning tab for real: restore a furniture line and confirm
+     it actually comes back after the background re-clean/re-chunk/
+     re-embed finishes; toggle a structural/runt chunk's "Include in
+     retrieval" and confirm it's reflected immediately (no re-processing
+     needed for that one).
+  7. Once confirmed, this feature is done — keep loading the real corpus
+     (M6).
 
 ## 11. Session log
 
@@ -887,3 +1097,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Tried the M5 review UI and gave feedback: no way to add a document from the UI, no visual way to see how documents/chunks relate, and the UI generally isn't user-friendly (asked specifically: no progress feedback, bare-bones design, hard to navigate). Confirmed chunk-level (not document-level) similarity graph is what's wanted, to be built now rather than deferred past M6. Built on `main` (sandbox still has no real Supabase): upload form + `uploadDocument` server action + `corpus ingest --json`; `/graph` page using `react-force-graph-2d` + a new `chunk_similarity_edges` Postgres function (HNSW-indexed per-chunk nearest-neighbours, not a full pairwise scan) exposed via Supabase RPC; persistent nav header, card-based layout, `AutoRefresh` polling component, and a pulsing status-dot for in-progress documents. `tsc`/`next build` clean across all three routes; `npm audit` shows no new vulnerabilities from the new dependency. Upload flow and graph rendering not verified against real data/browser (no credentials here). | Pull, `npm install`, apply the new `chunk_similarity_edges` migration, `npm run dev`, and actually use it: upload a real PDF, confirm it starts processing; open `/graph` once chunks are embedded and check nodes render/color/link correctly and clicking one highlights the right chunk; sanity-check the auto-refresh and new layout feel like a real improvement. Then this follow-up round (and M5 overall) is done — on to M6. |
 | 2026-07-18 | Asked whether the graph edges are "real links or making it up." Answer given: real cosine similarity over real embeddings (same pgvector operator/HNSW index the future chat app will use for retrieval at query time), not fabricated — but honestly limited to "these texts read as linguistically similar," which usually but not always tracks genuine topical relevance (boilerplate/table-structure text can false-positive; genuinely related content phrased differently can false-negative), and the 0.78/top-5 defaults are unvalidated guesses since there's barely any real corpus loaded yet. Then asked for improvements to actually understand the corpus before adding real files; picked click-to-preview, search-and-highlight, and topic clustering (declined a live threshold-filter slider). Built on `main` (still no real Supabase): `GraphPreviewPanel` (click a node, see full content + scored neighbours in a side panel, content fetched on demand via a new `getChunkContent` action so the graph page itself stays lightweight — dropped `content` from its chunk query entirely); search box wired to a new `corpus embed-query --json` CLI command (reuses `providers.py`, doesn't duplicate the NIM call in TS) + a new `search_chunks` Postgres function, highlighting matching nodes and fading the rest; a "Color: cluster" toggle using client-side union-find over the displayed edges (`lib/clustering.ts`) as an honest, documented-as-approximate stand-in for real topic modeling; a "Chunks"/"Documents" view toggle for a document-level zoom-out, aggregated client-side from the same edge data. Verified the two new pure-logic pieces (union-find, document-edge aggregation) standalone with hand-built test graphs before wiring into React, since this sandbox can't render canvas. `tsc`/`next build` clean across all four routes, no new `npm audit` findings. Interaction behavior (actual clicks/search/clustering against real embeddings) not verified — needs a real browser and real data. | Pull, install, apply both new migrations, `npm run dev`. Confirm the preview panel loads real content, run a real search query and sanity-check the matches, and — the actually interesting test — toggle cluster coloring once more than one document is loaded and judge honestly whether same-colored chunks across manuals read as related to a human, which is the real answer to "is this actually smart." Then start loading the rest of the real corpus (M6). |
 | 2026-07-18 | M6 started (real files going in), and search turned out to actually be broken: `Error: No such option '--json'` when running a real query. Root cause — `searchChunks` in `app/actions.ts` called `corpus embed-query <text> --json`, but `embed-query` (unlike `ingest`) never had a `--json` flag, it just always prints JSON; the flag was invalid and click rejected it. This shipped broken because the CLI-side test for `embed-query` only exercised the Python side directly, never the exact argv review-ui sends — a gap in how the CLI-from-Node integration points get tested. Reproduced the exact error with `CliRunner` first, then fixed by dropping the bad arg, then re-verified. Also asked how to verify documents without reading every one — built `lib/flags.ts`: cheap DB-only heuristics (zero chunks despite pages, low tokens/page, near-empty chunks, heavily-vision documents, the *specific* M4 prose-in-metadata pattern, missing doc_type), surfaced as a Flags column + "Flagged only" filter on the queue view and inline chunk highlighting on the document page. Verified the flag logic against 5 hand-built scenarios (including reproducing the real M4 prose bug to confirm it gets caught) before wiring in. `tsc`/`next build` clean, no new deps. | Pull, retry the search that failed (no reinstall needed), apply `search_chunks` if not already applied. Use the Flags column as the actual workflow going forward: open only what's flagged, spot-check a few unflagged documents occasionally to calibrate trust in the heuristics. Keep loading the real corpus. |
+| 2026-07-19 | Added the cleaning stage per a fully-specified task (furniture stripping, structural page/chunk tagging, runt handling, >15% safety rail, Cleaning tab, furniture-detector unit tests) — one genuine gap in the spec: the repeated-safety-warning test case referenced "(see note below)" with no note attached. Asked and got a clear answer: add a keyword exception (`warning`/`caution`/`danger`/`note:`), never auto-strip that content regardless of repetition, given this is a fire/security panel corpus. Built `clean.py` (new), updated `chunk.py` (reads cleaned pages, runt handling, structural metadata), `cli.py` (`_process` gains a clean step + early-stop on the safety rail, new `restore-furniture` command), `db.py` (`delete_chunks`), a new migration (`documents.metadata` column, graph/search RPCs updated to respect the new exclusion rule), and the review UI's new Cleaning tab. Found and fixed two real logic bugs before they shipped (not caught by the spec, caught by testing): `apply_runt_handling` initially couldn't cascade-merge multiple consecutive runts (excluded already-runt-tagged chunks as merge targets, not just structural ones); `clean_pages` initially flattened cleaned lines with a single join, silently destroying the paragraph boundaries `chunk.py`'s splitting depends on. Also worked through several of my own test-fixture bugs (templated "page N" body text registering as furniture itself) before the real test suite was trustworthy. 65/65 pipeline tests passing (14 new for `clean.py`, 10 new for runt handling), 3 hand-built end-to-end scenarios verified via monkeypatched DB (safety rail correctly passes on realistic content, correctly trips and blocks chunk/embed on sparse content, `proceed_override` correctly unsticks it), `tsc`/`next build` clean across all four routes. Nothing verified against real Supabase/NIM/manuals — same sandbox constraint as every session. | Pull, reinstall (no new deps either side), apply the new migration, `pytest` (expect 65 passed). Run a real manual through and actually judge the heuristic against real content: does furniture.json look right, does a real TOC page get tagged, does a repeated real safety warning survive, is 15% the right safety-rail threshold. Try restoring a furniture line and toggling a structural/runt chunk's retrieval inclusion for real. Then back to loading the rest of the corpus (M6). |

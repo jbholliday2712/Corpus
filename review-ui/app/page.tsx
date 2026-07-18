@@ -38,7 +38,7 @@ export default async function QueuePage({
   // chunk text to this page.
   const { data: chunkRows } = await supabase
     .from("chunks")
-    .select("document_id, token_count, extraction_path");
+    .select("document_id, token_count, extraction_path, metadata");
 
   const chunkCounts = new Map<string, number>();
   const chunksByDoc = new Map<string, ChunkStat[]>();
@@ -46,9 +46,14 @@ export default async function QueuePage({
     document_id: string;
     token_count: number | null;
     extraction_path: string | null;
+    metadata: Record<string, unknown> | null;
   }[]) {
     chunkCounts.set(row.document_id, (chunkCounts.get(row.document_id) ?? 0) + 1);
-    const stat: ChunkStat = { tokenCount: row.token_count, extractionPath: row.extraction_path };
+    const stat: ChunkStat = {
+      tokenCount: row.token_count,
+      extractionPath: row.extraction_path,
+      sectionType: (row.metadata?.section_type as string | undefined) ?? null,
+    };
     const list = chunksByDoc.get(row.document_id);
     if (list) list.push(stat);
     else chunksByDoc.set(row.document_id, [stat]);
@@ -65,6 +70,9 @@ export default async function QueuePage({
           manufacturer: doc.manufacturer,
           revision: doc.revision,
           docType: doc.doc_type,
+          cleaningWarning: doc.metadata?.cleaning_warning as
+            | { stripped_pct: number }
+            | undefined,
         },
         chunksByDoc.get(doc.id) ?? []
       )

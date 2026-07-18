@@ -61,6 +61,14 @@ def insert_chunks(rows: list[dict]) -> list[dict]:
     return res.data
 
 
+def delete_chunks(document_id: str) -> None:
+    """Used by `corpus restore-furniture`: cleaning changes what text gets
+    chunked, so the old chunk rows (and any embeddings on them) must be
+    replaced, not left to linger alongside a fresh set."""
+    client = get_client()
+    client.table("chunks").delete().eq("document_id", document_id).execute()
+
+
 def count_chunks(document_id: str) -> int:
     client = get_client()
     res = (

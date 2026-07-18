@@ -1,4 +1,17 @@
-from corpus.chunk import chunk_pages, estimate_tokens
+from corpus.chunk import apply_runt_handling, chunk_pages, estimate_tokens
+
+
+def _chunk(index, content, section, token_count, extraction_path="text", metadata=None, page=1):
+    return {
+        "content": content,
+        "page_start": page,
+        "page_end": page,
+        "section": section,
+        "extraction_path": extraction_path,
+        "token_count": token_count,
+        "metadata": metadata or {},
+        "chunk_index": index,
+    }
 
 
 def test_single_short_page_is_one_chunk():
@@ -116,3 +129,95 @@ def test_empty_page_contributes_no_chunks():
     chunks = chunk_pages(pages)
     assert len(chunks) == 1
     assert chunks[0]["page_end"] == 1
+
+
+def test_runt_merges_into_previous_chunk_with_same_section():
+    chunks = [
+        _chunk(0, "Zone Wiring", "Zone Wiring", token_count=3),
+        _chunk(1, "Connect the cable.", "Zone Wiring", token_count=5),
+    ]
+    result = apply_runt_handling(chunks)
+    assert len(result) == 1
+    assert result[0]["content"] == "Zone Wiring\n\nConnect the cable."
+    assert result[0]["chunk_index"] == 0
+
+
+def test_runt_cascades_across_multiple_consecutive_small_chunks():
+    chunks = [
+        _chunk(0, "a", "S", token_count=3),
+        _chunk(1, "b", "S", token_count=3),
+        _chunk(2, "c", "S", token_count=3),
+    ]
+    result = apply_runt_handling(chunks)
+    assert len(result) == 1
+    assert result[0]["content"] == "a\n\nb\n\nc"
+
+
+def test_runt_with_different_section_is_tagged_not_merged():
+    chunks = [
+        _chunk(0, "Zone Wiring intro text here.", "Zone Wiring", token_count=100),
+        _chunk(1, "Different Section", "Commissioning", token_count=4),
+    ]
+    result = apply_runt_handling(chunks)
+    assert len(result) == 2
+    assert result[1]["metadata"] == {"section_type": "runt"}
+    assert result[1]["content"] == "Different Section"
+
+
+def test_first_chunk_runt_with_no_previous_is_tagged():
+    chunks = [_chunk(0, "Tiny opener.", None, token_count=4)]
+    result = apply_runt_handling(chunks)
+    assert len(result) == 1
+    assert result[0]["metadata"] == {"section_type": "runt"}
+
+
+def test_runt_merge_clears_tag_once_combined_size_passes_threshold():
+    chunks = [
+        _chunk(0, "x" * 40, "S", token_count=10),
+        _chunk(1, "y" * 400, "S", token_count=10),  # declared small; real content is long
+    ]
+    result = apply_runt_handling(chunks)
+    assert len(result) == 1
+    assert result[0]["metadata"] == {}
+    assert result[0]["token_count"] >= 50
+
+
+def test_structural_chunk_is_never_a_runt_merge_target():
+    chunks = [
+        _chunk(0, "TOC entry", "Contents", token_count=5, metadata={"section_type": "structural"}),
+        _chunk(1, "tiny runt", "Contents", token_count=4),
+    ]
+    result = apply_runt_handling(chunks)
+    assert len(result) == 2
+    assert result[0]["metadata"] == {"section_type": "structural"}
+    assert result[1]["metadata"] == {"section_type": "runt"}
+
+
+def test_already_structural_chunk_is_not_reclassified_as_runt():
+    chunks = [_chunk(0, "TOC", "Contents", token_count=3, metadata={"section_type": "structural"})]
+    result = apply_runt_handling(chunks)
+    assert result[0]["metadata"] == {"section_type": "structural"}
+
+
+def test_normal_sized_chunks_pass_through_unchanged():
+    chunks = [
+        _chunk(0, "a" * 400, "S1", token_count=100),
+        _chunk(1, "b" * 400, "S2", token_count=100),
+    ]
+    result = apply_runt_handling(chunks)
+    assert len(result) == 2
+    assert [c["chunk_index"] for c in result] == [0, 1]
+
+
+def test_structural_metadata_set_when_any_source_page_is_structural():
+    pages = [
+        {"page": 1, "text": "Contents\n\nInstallation .......... 4", "structural": True},
+    ]
+    chunks = chunk_pages(pages)
+    assert chunks[0]["metadata"] == {"section_type": "structural"}
+
+
+def test_no_structural_metadata_for_ordinary_pages():
+    pages = [{"page": 1, "text": "Ordinary prose about zone wiring.", "structural": False}]
+    chunks = chunk_pages(pages)
+    assert chunks[0]["metadata"] == {}

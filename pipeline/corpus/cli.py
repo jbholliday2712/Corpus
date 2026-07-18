@@ -6,24 +6,29 @@ from pathlib import Path
 
 import click
 
-from corpus import chunk, db, embed, extract, intake, metadata
+from corpus import chunk, clean, db, embed, extract, intake, metadata
 from corpus.config import load_settings
 from corpus.paths import INBOX_DIR
 from corpus.providers import NIMClient
 
 
 def _process(document_id: str) -> None:
-    """Run extract -> metadata -> chunk -> embed for one document. Every
-    stage is resumable (extract/chunk/embed/metadata each skip work already
-    done), so this is also what `corpus retry` calls — re-running it on a
-    document that got partway through just picks up where it left off.
-    Metadata inference is best-effort: it's a human-reviewed enrichment, not
-    part of the core content pipeline, so a bad/missing NIM_LLM_MODEL or a
-    malformed LLM response is logged and skipped rather than failing the
-    whole document. On any other failure, mark the document `failed` with
-    the error message and re-raise so the caller decides whether to keep
-    going (matches STATUS.md's failure handling: one bad PDF must not kill a
-    `watch` loop processing others)."""
+    """Run extract -> metadata -> clean -> chunk -> embed for one document.
+    Every stage is resumable (extract/clean/chunk/embed/metadata each skip
+    work already done), so this is also what `corpus retry` calls —
+    re-running it on a document that got partway through just picks up
+    where it left off. Metadata inference is best-effort: it's a
+    human-reviewed enrichment, not part of the core content pipeline, so a
+    bad/missing NIM_LLM_MODEL or a malformed LLM response is logged and
+    skipped rather than failing the whole document. Cleaning's safety rail
+    (STATUS.md §4) can stop the pipeline early — if >15% of a document's
+    lines get stripped as furniture, that's set to status='review' with a
+    warning instead of proceeding to chunk/embed automatically, since the
+    heuristic likely misfired and shouldn't be trusted with NIM quota until
+    a human looks at the Cleaning tab. On any other failure, mark the
+    document `failed` with the error message and re-raise so the caller
+    decides whether to keep going (matches STATUS.md's failure handling:
+    one bad PDF must not kill a `watch` loop processing others)."""
     try:
         pages = extract.extract_document(document_id)
         click.echo(f"  extracted {pages} pages")
@@ -32,6 +37,19 @@ def _process(document_id: str) -> None:
             click.echo(f"  inferred metadata: {meta}")
         except Exception as exc:  # noqa: BLE001
             click.echo(f"  metadata inference skipped: {exc}")
+
+        report = clean.clean_document(document_id)
+        click.echo(
+            f"  cleaned: {report.get('stripped_lines', 0)}/{report.get('total_lines', 0)} "
+            f"lines stripped ({report.get('stripped_pct', 0)}%)"
+        )
+        if report.get("safety_rail_triggered"):
+            click.echo(
+                "  stripped-line ratio exceeded the safety threshold — stopped for "
+                "review, not chunking/embedding automatically"
+            )
+            return
+
         n_chunks = chunk.chunk_document(document_id)
         click.echo(f"  chunked into {n_chunks} chunks")
         n_embedded = embed.embed_document(document_id)
@@ -129,7 +147,7 @@ def embed_query(text: str):
 @main.command()
 @click.argument("document_id")
 def process(document_id: str):
-    """Run extract -> metadata -> chunk -> embed for a document."""
+    """Run extract -> metadata -> clean -> chunk -> embed for a document."""
     try:
         _process(document_id)
     except Exception as exc:  # noqa: BLE001
@@ -141,8 +159,8 @@ def process(document_id: str):
 @click.option("--interval", default=5, help="Seconds between inbox scans.")
 def watch(inbox: Path, interval: int):
     """Watch ./inbox/, ingest any PDF dropped there, and run the full
-    extract -> metadata -> chunk -> embed pipeline on it. One bad PDF is
-    logged and skipped; the loop keeps going."""
+    extract -> metadata -> clean -> chunk -> embed pipeline on it. One bad
+    PDF is logged and skipped; the loop keeps going."""
     inbox.mkdir(parents=True, exist_ok=True)
     click.echo(f"Watching {inbox} (Ctrl+C to stop)...")
     seen: set[str] = set()
@@ -170,7 +188,10 @@ def watch(inbox: Path, interval: int):
 @click.argument("document_id")
 def retry(document_id: str):
     """Re-run a document from its last completed stage. Extract skips pages
-    already written, metadata skips if already inferred, chunk skips if
+    already written, metadata skips if already inferred, clean skips
+    regenerating cleaned pages if they already exist (but always
+    re-evaluates the safety-rail decision, so a "proceed anyway" override
+    set via the review UI actually takes effect here), chunk skips if
     chunks already exist, embed only fills in missing embeddings — so this
     is safe to run on a `failed` document without redoing NIM calls (or
     burning quota) for work that already succeeded before the failure."""
@@ -182,6 +203,52 @@ def retry(document_id: str):
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(f"Retry failed: {exc}")
     click.echo(f"Retried {document_id} -> status=review")
+
+
+@main.command(name="restore-furniture")
+@click.argument("document_id")
+@click.argument("normalized_line")
+def restore_furniture(document_id: str, normalized_line: str):
+    """Mark a normalized furniture line (as it appears in furniture.json /
+    the review UI's Cleaning tab) as never-strip for this document, then
+    force a re-clean -> re-chunk -> re-embed. Unlike `retry`, this always
+    regenerates the cleaned pages (the override changes what gets
+    stripped) and always replaces existing chunks (the old ones were built
+    from text that's about to change) rather than skipping already-done
+    work."""
+    from corpus.paths import WORK_DIR
+
+    doc_row = db.get_document(document_id)
+    if doc_row is None:
+        raise click.ClickException(f"no document {document_id}")
+
+    overrides_path = WORK_DIR / doc_row["file_hash"] / "furniture_overrides.json"
+    overrides: set[str] = set()
+    if overrides_path.exists():
+        overrides = set(json.loads(overrides_path.read_text(encoding="utf-8")))
+    overrides.add(normalized_line)
+    overrides_path.parent.mkdir(parents=True, exist_ok=True)
+    overrides_path.write_text(json.dumps(sorted(overrides)), encoding="utf-8")
+
+    try:
+        report = clean.clean_document(document_id, force=True)
+        click.echo(
+            f"  re-cleaned: {report.get('stripped_lines', 0)}/{report.get('total_lines', 0)} "
+            f"lines stripped ({report.get('stripped_pct', 0)}%)"
+        )
+        if report.get("safety_rail_triggered"):
+            click.echo("  still over the safety threshold — stopped for review")
+            return
+
+        db.delete_chunks(document_id)
+        n_chunks = chunk.chunk_document(document_id)
+        click.echo(f"  re-chunked into {n_chunks} chunks")
+        n_embedded = embed.embed_document(document_id)
+        click.echo(f"  re-embedded {n_embedded} chunks -> status=review")
+        db.update_document(document_id, {"error_message": None})
+    except Exception as exc:  # noqa: BLE001
+        db.update_document(document_id, {"status": "failed", "error_message": str(exc)})
+        raise click.ClickException(f"Restore failed: {exc}")
 
 
 @main.command(name="status")

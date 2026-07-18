@@ -27,8 +27,30 @@ export interface DocumentRow {
   status: DocStatus;
   error_message: string | null;
   metadata_confirmed: boolean;
+  metadata: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface CleaningWarning {
+  stripped_pct: number;
+  message: string;
+}
+
+export interface FurnitureEntry {
+  normalized: string;
+  page_count: number;
+  example_pages: number[];
+  example_lines: string[];
+}
+
+export interface FurnitureReport {
+  total_pages: number;
+  total_lines: number;
+  stripped_lines: number;
+  stripped_pct: number;
+  threshold_pages: number;
+  furniture: FurnitureEntry[];
 }
 
 export interface ChunkRow {
