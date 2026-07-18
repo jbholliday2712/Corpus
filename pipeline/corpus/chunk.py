@@ -20,6 +20,17 @@ _TABLE_LINE_RE = re.compile(r"\|")
 _PROCEDURE_LINE_RE = re.compile(r"^\s*\d+[.)]\s+\S")
 _HEADING_MAX_CHARS = 80
 
+# A single bold "**Label:** value" line (e.g. "**Page Number:** 4",
+# "**Battery Status:** OK") is a vision-transcribed data field, not a
+# section heading — real headings don't read as a labeled key/value pair.
+# Left unfiltered, these get picked up by _is_heading (short, single-line,
+# no trailing punctuation) and become `section` for every chunk after them
+# until the next real heading, which is confusing wherever section is
+# surfaced (the Cleaning/Chunks tabs, and especially the /graph view, where
+# unrelated chunks scattered across many real pages all end up labeled with
+# the same misleading field text).
+_FIELD_VALUE_LINE_RE = re.compile(r"^\*\*[^*\n]+:\*\*")
+
 
 def estimate_tokens(text: str) -> int:
     """Rough chars/4 approximation. Good enough for chunk sizing; not tied
@@ -58,6 +69,8 @@ def _is_heading(para: str, lines: list[str]) -> bool:
     if len(para) > _HEADING_MAX_CHARS:
         return False
     if para.endswith((".", ",", ";", ":")):
+        return False
+    if _FIELD_VALUE_LINE_RE.match(para):
         return False
     return True
 

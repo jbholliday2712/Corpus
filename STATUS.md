@@ -1256,21 +1256,51 @@ click approve. Repeat for every manual we use at work.
     `next dev` still gives the same clean credentials-missing 500 on every
     Supabase-touching route (confirms nothing broke, not a real
     end-to-end check).
-  - **Open question, not yet resolved**: asked (in a real 46-page manual,
-    Enforcer V11 Programming Guide) why furniture detection only found two
-    repeated lines — the document title header and the bare page number —
-    when more boilerplate was expected. Without access to the real
-    extracted pages in this sandbox, couldn't tell whether that's a
-    threshold problem (a per-chapter header that only repeats on, say,
-    20% of pages never crosses `FURNITURE_MIN_PAGE_RATIO`), a matching
-    problem (vision/OCR introduces small per-page variance that exact
-    normalized-string matching in `detect_furniture` can't merge), or just
-    correct behavior for this particular document. Asked for a sample of
-    the raw `work/<hash>/pages/*.md` content the detector is missing;
-    still waiting on that before touching `clean.py` again — don't guess
-    at a fix without seeing what's actually being missed.
+  - **Furniture question, resolved (indirectly)**: asked why furniture
+    detection only found two repeated lines on the real 46-page Enforcer
+    V11 manual. Couldn't diagnose blind, but the follow-up report (`/graph`
+    neighbor labels reading `**Page Number:** 4` on many different real
+    pages — p.4, p.5, p.6, p.7, p.8, p.9, p.13, ...) turned out to be the
+    same underlying issue seen from a different angle — see below.
+- [x] **Fixed a real chunking bug: bold "field: value" vision artifacts
+      were being classified as section headings.** Root-caused from the
+      `/graph` complaint above: `chunkLabel()` (`GraphExplorer.tsx`)
+      builds a node's label from `chunk.section`, and clicking a
+      "related chunk" jumps straight to that chunk — so a wrong `section`
+      makes the whole graph look both mislabeled *and* miswired ("click on
+      one, it goes to different stuff"), even though the similarity edges
+      and click behavior were both working correctly the whole time. The
+      actual defect was upstream in `chunk.py`: `_is_heading()` classifies
+      any short, single-line, no-trailing-punctuation paragraph as a
+      section heading — which also matches a vision-transcribed
+      `**Page Number:** 4`-style bold field line (a data value, not a
+      title). Once picked up as a heading, it becomes `chunk_section` /
+      `last_heading` for every chunk after it until the next real heading,
+      so many unrelated chunks across many different real pages all ended
+      up labeled with the same misleading text — explaining both "the
+      labels don't make sense" and "clicking one goes to unrelated
+      content" (the content was never wrong, only the label). This also
+      explains the furniture question from the same session, without
+      needing the raw-page sample I'd asked for: a field whose literal
+      value is constant garbage (always "4", not the real page number)
+      would still only be present on the subset of pages that went through
+      the vision path, likely below `FURNITURE_MIN_PAGE_RATIO` of the
+      *whole* 46-page document — so it never crossed the furniture
+      threshold, survived cleaning as ordinary text, and then got
+      misclassified as a heading by `chunk.py`. Fixed with a new
+      `_FIELD_VALUE_LINE_RE` guard in `_is_heading()` (excludes lines
+      matching `^\*\*[^*\n]+:\*\*`) — the field text itself still ends up
+      in chunk content (a separate, lower-priority content-quality
+      question, not addressed here), it just no longer becomes `section`.
+      2 new tests confirming the field-value line doesn't become
+      `section` and doesn't overwrite a real preceding heading (78/78
+      pipeline-wide). Not verified against the real document — needs a
+      **reprocess from 'chunk'** (using the feature built earlier this
+      session) to regenerate its chunks under the fix.
 - [ ] **Needs to happen on your machine:**
-  1. `git pull`, `npm install` (no new deps), `npm run dev`.
+  1. `git pull`. `cd pipeline && pip install -e ".[dev]"`, `pytest` →
+     expect 78 passed. `cd review-ui && npm install` (no new deps), `npm
+     run dev`.
   2. Open the queue view and confirm the new segmented progress bar
      renders sensibly for a document in each state (queued, mid-pipeline,
      review, done, failed) — check it against a document you kick off a
@@ -1278,9 +1308,14 @@ click approve. Repeat for every manual we use at work.
   3. Click Retry / Approve / a Restore-furniture-line button / Reprocess
      and confirm each shows a spinner immediately (not just a disabled
      look) for that first moment, then hands off to the progress bar.
-  4. Reply with what other boilerplate you'd expect flagged as furniture
-     on the Enforcer V11 manual (or paste a couple of raw page files) so
-     the actual detection question above can get resolved next session.
+  4. Reprocess the Enforcer V11 document **from 'chunk'** (chunks only —
+     cleaned pages don't need to change) and reopen `/graph`: confirm
+     `**Page Number:** 4` (and any other bold-field artifacts) no longer
+     show up as node/neighbor labels, and that clicking a related chunk
+     now visibly makes sense relative to its label. If you spot a
+     *different* garbage label pattern surviving this fix, paste it —
+     that's the concrete data needed to extend `_FIELD_VALUE_LINE_RE`
+     rather than guessing at a broader pattern up front.
 
 ## 11. Session log
 
@@ -1304,4 +1339,5 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | M6 started (real files going in), and search turned out to actually be broken: `Error: No such option '--json'` when running a real query. Root cause — `searchChunks` in `app/actions.ts` called `corpus embed-query <text> --json`, but `embed-query` (unlike `ingest`) never had a `--json` flag, it just always prints JSON; the flag was invalid and click rejected it. This shipped broken because the CLI-side test for `embed-query` only exercised the Python side directly, never the exact argv review-ui sends — a gap in how the CLI-from-Node integration points get tested. Reproduced the exact error with `CliRunner` first, then fixed by dropping the bad arg, then re-verified. Also asked how to verify documents without reading every one — built `lib/flags.ts`: cheap DB-only heuristics (zero chunks despite pages, low tokens/page, near-empty chunks, heavily-vision documents, the *specific* M4 prose-in-metadata pattern, missing doc_type), surfaced as a Flags column + "Flagged only" filter on the queue view and inline chunk highlighting on the document page. Verified the flag logic against 5 hand-built scenarios (including reproducing the real M4 prose bug to confirm it gets caught) before wiring in. `tsc`/`next build` clean, no new deps. | Pull, retry the search that failed (no reinstall needed), apply `search_chunks` if not already applied. Use the Flags column as the actual workflow going forward: open only what's flagged, spot-check a few unflagged documents occasionally to calibrate trust in the heuristics. Keep loading the real corpus. |
 | 2026-07-18 | Added reprocess/hard-reset controls to the review UI, on `main` (sandbox still has no real Supabase/NIM). Neither `corpus reprocess` nor `corpus reset` existed before this session; built `pipeline/corpus/reprocess.py` (`reprocess_document`/`reset_hard`, importable, reusing the "delete what the target stage's resumability guard checks, then call the normal stage function" pattern `restore-furniture` already established) with `cli.py`'s new `reprocess`/`reset` commands as thin wrappers, plus two new `db.py` functions (`delete_document`, `clear_chunk_embeddings`). 11 new tests against a call-order-recording `FakeDB` (76/76 pipeline-wide), plus a `CliRunner` smoke test of the new CLI wiring. review-ui: three new Route Handlers (`GET /api/documents` for 3s polling, `POST .../reprocess`, `POST .../reset`, all guarded against acting on an in-progress document) instead of server actions, per explicit spec; a new `ReprocessControls` split-button+overflow-menu component (warns about losing manual chunk retrieval toggles only for the two stages that actually delete+recreate chunk rows; hard-reset behind a detailed `confirm()`); `DocumentTable` now polls and merges live status/error without a full server re-render, replacing `AutoRefresh` on the queue page specifically (left untouched on the document detail page). `tsc`/`next build` clean across all six routes; `next dev` smoke-tested locally — bad input 400s before touching Supabase, missing-credentials 500s are the same clean error every other route already gives here. Not run against real data/browser. | Pull, install both sides, `pytest` (76 passed expected), `npm run dev`. Reprocess the CTec manual from the UI and watch status move through the stages live in the queue view (the task's own acceptance test); try each dropdown stage, confirm the manual-chunk-toggle warning appears/behaves correctly, hard-reset a disposable document and confirm the filesystem state is actually gone, and confirm both controls are genuinely disabled mid-run. |
 | 2026-07-18 | Tried the reprocess controls; worked, but two pieces of feedback: (1) furniture detection on a real 46-page manual (Enforcer V11 Programming Guide) only caught two repeated lines (the title header, the bare page number) — "that can't be it," expected more boilerplate to be flagged. Couldn't diagnose blind without seeing the actual raw pages (could be a threshold problem, a vision/OCR-variance matching problem, or genuinely correct for this document) — asked for a sample of what's being missed rather than guessing at a `clean.py` change; left open. (2) Wanted progress bars on running tasks generally, not just the queue's status word. Built on `main` (sandbox still has no real Supabase): new `StageProgress` component (segmented Queued/Extract/Clean&chunk/Embed/Review bar driven by `documents.status`, works for every path that moves a document through those statuses — processing, retry, reprocess — without knowing which one triggered it), replacing `StatusBadge` (deleted entirely, not left as dead code; its `ACTIVE_STATUSES` constant moved to `lib/types.ts`) in both the queue table and the document detail page. New `Spinner`/`PendingSubmitButton` components wired into every button that kicks off a background run (retry, approve, restore-furniture-line, proceed-anyway, delete, reprocess, hard reset) so a click gets immediate visual feedback instead of looking inert until the next poll. `tsc`/`next build` clean across all six routes, `next dev` smoke-tested (same expected credentials-missing 500s). | Pull, `npm install`, `npm run dev`. Check the new progress bar renders sensibly across every status and that each button shows its spinner immediately on click. Separately: reply with what furniture you'd expect flagged on the Enforcer V11 manual (or paste a couple of raw `work/<hash>/pages/*.md` files) so the detection question can actually get resolved instead of guessed at. |
+| 2026-07-18 | Root-caused the furniture-detection and confusing-graph-labels feedback from the same session down to one bug: `chunk.py`'s `_is_heading()` heuristic (short, single-line, no trailing punctuation) also matches vision-transcribed `**Label:** value` bold field lines, e.g. `**Page Number:** 4`. Once misclassified as a heading, that text becomes `chunk.section` — and thus `/graph`'s node/neighbor labels — for every chunk after it, so many unrelated chunks on many different real pages all showed the same misleading label, and clicking a "related chunk" correctly jumped to genuinely different content that just had a lying label (the edges/click behavior were never broken). Also explains why furniture detection missed it without needing the raw-page sample asked for last session: a field whose value is stuck at a constant "4" would still only appear on the subset of pages that went through the vision path, likely too few of the full 46 to cross `FURNITURE_MIN_PAGE_RATIO`. Fixed with a `_FIELD_VALUE_LINE_RE` guard in `_is_heading()`; 2 new tests (78/78 pipeline-wide) confirming the field line doesn't become `section` and doesn't clobber a real preceding heading. Not verified against the real document — the fix only helps once the affected document's chunks are regenerated. | Pull, install, `pytest` (78 passed expected). Reprocess the Enforcer V11 document **from 'chunk'** (via the reprocess controls built earlier this session) and reopen `/graph` — confirm `**Page Number:** 4`-style labels are gone and clicking a related chunk now makes sense relative to its label. Paste any other garbage label pattern that survives, rather than guessing at a broader fix up front. |
 | 2026-07-19 | Added the cleaning stage per a fully-specified task (furniture stripping, structural page/chunk tagging, runt handling, >15% safety rail, Cleaning tab, furniture-detector unit tests) — one genuine gap in the spec: the repeated-safety-warning test case referenced "(see note below)" with no note attached. Asked and got a clear answer: add a keyword exception (`warning`/`caution`/`danger`/`note:`), never auto-strip that content regardless of repetition, given this is a fire/security panel corpus. Built `clean.py` (new), updated `chunk.py` (reads cleaned pages, runt handling, structural metadata), `cli.py` (`_process` gains a clean step + early-stop on the safety rail, new `restore-furniture` command), `db.py` (`delete_chunks`), a new migration (`documents.metadata` column, graph/search RPCs updated to respect the new exclusion rule), and the review UI's new Cleaning tab. Found and fixed two real logic bugs before they shipped (not caught by the spec, caught by testing): `apply_runt_handling` initially couldn't cascade-merge multiple consecutive runts (excluded already-runt-tagged chunks as merge targets, not just structural ones); `clean_pages` initially flattened cleaned lines with a single join, silently destroying the paragraph boundaries `chunk.py`'s splitting depends on. Also worked through several of my own test-fixture bugs (templated "page N" body text registering as furniture itself) before the real test suite was trustworthy. 65/65 pipeline tests passing (14 new for `clean.py`, 10 new for runt handling), 3 hand-built end-to-end scenarios verified via monkeypatched DB (safety rail correctly passes on realistic content, correctly trips and blocks chunk/embed on sparse content, `proceed_override` correctly unsticks it), `tsc`/`next build` clean across all four routes. Nothing verified against real Supabase/NIM/manuals — same sandbox constraint as every session. | Pull, reinstall (no new deps either side), apply the new migration, `pytest` (expect 65 passed). Run a real manual through and actually judge the heuristic against real content: does furniture.json look right, does a real TOC page get tagged, does a repeated real safety warning survive, is 15% the right safety-rail threshold. Try restoring a furniture line and toggling a structural/runt chunk's retrieval inclusion for real. Then back to loading the rest of the corpus (M6). |

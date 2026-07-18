@@ -36,6 +36,40 @@ def test_heading_is_recorded_as_section():
     assert chunks[0]["section"] == "Zone Wiring"
 
 
+def test_bold_field_value_line_is_not_treated_as_a_heading():
+    # A real vision-transcription artifact seen on a scanned manual: a bold
+    # "**Label:** value" line (a data field, not a section title) was being
+    # picked up by the generic single-line/short/no-trailing-punctuation
+    # heading heuristic, becoming `section` for every chunk after it —
+    # confusing wherever section is surfaced, especially unrelated chunks
+    # across many real pages all showing the same misleading label in the
+    # graph view.
+    pages = [
+        {
+            "page": 1,
+            "text": "**Page Number:** 4\n\nSome real body text about wiring the zone.",
+        }
+    ]
+    chunks = chunk_pages(pages)
+    assert chunks[0]["section"] is None
+    assert "Page Number" in chunks[0]["content"]  # still real content, just not a heading
+
+
+def test_bold_field_value_line_does_not_overwrite_a_real_heading():
+    pages = [
+        {
+            "page": 1,
+            "text": (
+                "Zone Wiring\n\n"
+                "**Page Number:** 4\n\n"
+                "Connect the zone cable to terminals 1 and 2."
+            ),
+        }
+    ]
+    chunks = chunk_pages(pages)
+    assert chunks[0]["section"] == "Zone Wiring"
+
+
 def test_large_document_splits_into_multiple_chunks_with_increasing_pages():
     filler = "This paragraph describes panel configuration in some detail. " * 15
     pages = [{"page": i, "text": filler} for i in range(1, 9)]
