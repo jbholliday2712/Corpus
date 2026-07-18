@@ -313,21 +313,32 @@ click approve. Repeat for every manual we use at work.
     all passing.
   - Smoke-tested `extract_document`'s PyMuPDF loop against a synthetic
     in-memory PDF (no DB involved) — text comes out per page as expected.
-  - **Not run against real Supabase/NIM** — this sandbox has no `.env` (it
-    only exists on your laptop from the M1 session). `corpus check` here
-    shows everything missing/skipped, same as a fresh clone would.
-- [ ] **Needs to happen on your machine, where `pipeline/.env` lives:**
-  1. `git pull`, then from `pipeline/`: `pip install -e ".[dev]"` (new files,
-     no new dependencies beyond what M1 already added).
-  2. `pytest` — should show 7 passed, same as here.
-  3. Drop one clean CTec XFP manual (or whatever's on hand) into `inbox/`,
-     then `corpus watch` (or `corpus ingest <path>` + `corpus process
-     <document_id>` if you'd rather step through it manually).
-  4. Check `corpus status` shows `review` for that document, then eyeball a
-     few rows in the `chunks` table in Supabase — tables/procedures intact,
-     `page_start`/`page_end` sane, embeddings non-null.
-  5. If it looks good, this is M2 done — report back and I'll start M3
-     (vision path + triage) with whatever `NIM_VISION_MODEL` you've set.
+- [x] **M2 verified end-to-end against real Supabase/NIM** (on the laptop,
+      where `.env` lives): `git pull`, `pip install -e ".[dev]"`, `pytest`
+      → 7 passed. Ran the full pipeline on a synthetic 3-page test PDF
+      (heading + paragraph + markdown table + numbered procedure, built
+      with PyMuPDF, not a real manual) via `corpus ingest` +
+      `corpus process <id>`:
+  - `extract` → 3 pages written to `work/<hash>/pages/*.md`.
+  - `chunk` → 1 chunk (content was small enough to fit under 1000 tokens):
+    table rows and the numbered procedure both came through intact in
+    `content`, nothing split.
+  - `embed` → NIM embed call succeeded; verified the stored `chunks.embedding`
+    is genuinely 1024 floats (PostgREST returns pgvector columns as a
+    string, e.g. `"[0.1,0.2,...]"`, not a JSON array — `len()` on it counts
+    characters, not dims; parse/count commas to check the real length).
+  - `corpus status` showed `review` for the document, as expected.
+  - Deleted the synthetic document afterward (`documents` row cascades to
+    `chunks`) plus its `store/`/`work/` files — it was a mechanics smoke
+    test, not real corpus content.
+- [ ] **Still needed for a *real* M2 sign-off:** run it again with an actual
+      clean digital CTec XFP manual (or whatever's on hand) via `corpus
+      watch` or `corpus ingest` + `corpus process`, and eyeball the resulting
+      chunks for genuine content quality (section headings, real tables,
+      real procedures) — the synthetic test only proves the mechanics work,
+      not that chunking judgment is good on a real document. Once that
+      looks right, M2 is actually done and M3 (vision path + triage) can
+      start, pending `NIM_VISION_MODEL`.
 
 ## 11. Session log
 
@@ -337,3 +348,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-17 | M1 skeleton built on `main`: repo layout, `pipeline/` package (config, providers, db, cli stub, intake), `db/schema.sql`, chunk test scaffold. All committed directly to main per new workflow (no per-session branches). Verified `corpus check` degrades gracefully with no `.env`, `pytest` passes. | Fill in real `.env` values, apply schema to Supabase, run `corpus check` to confirm embedding dims, then start M2 (text-path happy path with one clean manual). |
 | 2026-07-18 | M1 finished: moved schema to `supabase/migrations/` + `config.toml` for the GitHub integration; renamed `.env.example` → `.env` and filled in real credentials; fixed local Norton SSL interception breaking Python HTTPS; caught a publishable-key-in-service-key-slot mistake; migration didn't auto-apply via the GitHub integration within ~3 min so applied it manually over `DATABASE_URL`. `corpus check` now fully green (Supabase reachable, tables exist, NIM embed confirms 1024 dims). | Confirm in the Supabase dashboard whether the GitHub integration is actually linked (Project Settings → Integrations → GitHub) so future migrations auto-apply; if not, keep using the manual `DATABASE_URL` apply. Then start M2. |
 | 2026-07-18 | M2 built on `main` (different session/sandbox than M1 — no `.env` here, so nothing was run against real Supabase/NIM). Implemented real `extract.py`/`chunk.py`/`embed.py`, added `corpus process`/wired `watch` to run the full pipeline, added `paths.py`. Unit-tested the chunker (7 passing tests) and smoke-tested PyMuPDF extraction against a synthetic PDF. | Run it for real: `git pull`, install, `pytest`, then feed it an actual manual via `corpus watch` and check the `chunks` table. Report back so M3 (vision path) can start. |
+| 2026-07-18 | Pulled M2 onto the laptop and ran it against real Supabase/NIM: `pytest` 7/7, then a synthetic 3-page PDF through `ingest` → `process` → verified `documents`/`chunks` rows in Supabase (table + procedure stayed intact in one chunk, embedding genuinely 1024 dims), then cleaned the test doc out. Mechanics confirmed working end-to-end. | Run the same flow against a real manual (not synthetic) to sign off M2 for real, then start M3 (vision path + triage) once `NIM_VISION_MODEL` is set. |
