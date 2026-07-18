@@ -1,4 +1,12 @@
-from corpus.chunk import apply_runt_handling, chunk_pages, estimate_tokens
+from corpus.chunk import (
+    _find_repeated_heading_texts,
+    _is_heading,
+    _is_heading_shaped,
+    _normalize_heading_text,
+    apply_runt_handling,
+    chunk_pages,
+    estimate_tokens,
+)
 
 
 def _chunk(index, content, section, token_count, extraction_path="text", metadata=None, page=1):
@@ -68,6 +76,62 @@ def test_bold_field_value_line_does_not_overwrite_a_real_heading():
     ]
     chunks = chunk_pages(pages)
     assert chunks[0]["section"] == "Zone Wiring"
+
+
+def test_normalize_heading_text_strips_markdown_and_case():
+    assert _normalize_heading_text("**Table of Contents**") == "table of contents"
+    assert _normalize_heading_text("### Battery Status") == "battery status"
+    assert _normalize_heading_text("Zone Wiring") == "zone wiring"
+
+
+def test_find_repeated_heading_texts_needs_at_least_three_distinct_pages():
+    pages = [
+        {"page": 1, "text": "Zone Wiring\n\nBody text one."},
+        {"page": 2, "text": "**Table of Contents**\n\nBody text two."},
+        {"page": 3, "text": "**Table of Contents**\n\nBody text three."},
+        {"page": 4, "text": "**Table of Contents**\n\nBody text four."},
+    ]
+    repeated = _find_repeated_heading_texts(pages)
+    assert "table of contents" in repeated
+    assert "zone wiring" not in repeated  # only appears once
+
+
+def test_find_repeated_heading_texts_below_threshold_not_flagged():
+    pages = [
+        {"page": 1, "text": "Overview\n\nBody text one."},
+        {"page": 2, "text": "Overview\n\nBody text two."},
+    ]
+    # A short heading legitimately reused twice in a small document — two
+    # occurrences is below _MIN_REPEATED_HEADING_PAGES, so it's still
+    # treated as a real (if reused) heading, not boilerplate.
+    assert "overview" not in _find_repeated_heading_texts(pages)
+
+
+def test_is_heading_rejects_repeated_text():
+    repeated = {"table of contents"}
+    assert not _is_heading("**Table of Contents**", ["**Table of Contents**"], repeated)
+    assert _is_heading("Zone Wiring", ["Zone Wiring"], repeated)
+    assert _is_heading_shaped("**Table of Contents**", ["**Table of Contents**"])
+
+
+def test_repeated_heading_shaped_line_is_not_treated_as_a_real_heading():
+    # Mirrors a real bug: a vision-hallucinated "**Table of Contents**"
+    # line transcribed verbatim onto several unrelated real pages (not the
+    # actual TOC page) must not become `section` for the genuine content
+    # on those pages — a real heading doesn't repeat verbatim within one
+    # document, and letting it through made unrelated chunks across many
+    # pages all show up with the same misleading label (STATUS.md session
+    # log — this is what "Table of Contents (p.8) 88%" turned out to be).
+    filler = "This paragraph describes panel configuration in some detail. " * 15
+    pages = [
+        {"page": 1, "text": f"Zone Wiring\n\n{filler}"},
+        {"page": 2, "text": f"**Table of Contents**\n\n{filler}"},
+        {"page": 3, "text": f"**Table of Contents**\n\n{filler}"},
+        {"page": 4, "text": f"**Table of Contents**\n\n{filler}"},
+    ]
+    chunks = chunk_pages(pages, max_tokens=200, overlap_tokens=20)
+    assert chunks[0]["section"] == "Zone Wiring"
+    assert all(c["section"] != "**Table of Contents**" for c in chunks)
 
 
 def test_large_document_splits_into_multiple_chunks_with_increasing_pages():

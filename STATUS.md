@@ -1297,9 +1297,45 @@ click approve. Repeat for every manual we use at work.
       pipeline-wide). Not verified against the real document — needs a
       **reprocess from 'chunk'** (using the feature built earlier this
       session) to regenerate its chunks under the fix.
+- [x] **Second, more general instance of the same bug class, found from a
+      follow-up report on the same real document**: `/graph` neighbor
+      labels reading `**Table of Contents**` on many different real pages
+      (p.4, p.5, p.6, p.8, p.9, p.12, p.13, p.27, ...) — not the actual TOC
+      page. The `_FIELD_VALUE_LINE_RE` fix above didn't cover this, since
+      `**Table of Contents**` isn't a `Label: value` field, it's a bold
+      *phrase* — same underlying weakness in `_is_heading()` (anything
+      short/single-line/unpunctuated qualifies), different literal text
+      vision hallucinated onto unrelated pages. Rather than special-case
+      another exact string, generalized the fix: a genuine section heading
+      is specific to where it appears and essentially never repeats
+      verbatim within one document, so `chunk_pages` now does a
+      document-local pre-pass (`_find_repeated_heading_texts`, new) that
+      collects every heading-shaped line across all pages, normalizes it
+      (strips `#`/`*` markdown + case), and excludes any that appear on 3
+      or more distinct pages from being classified as a real heading at
+      all (`_is_heading` now takes that set and checks against it,
+      alongside the existing field-value guard). Deliberately a much lower
+      bar than clean.py's furniture detector (~30% of the document): a
+      short heading legitimately reused 2x in a 46-page manual is still
+      allowed as a real heading, but the false-positive cost of wrongly
+      excluding a genuinely-3x-reused heading is low anyway (the chunk
+      keeps its full content either way — it just falls back to whichever
+      real heading actually preceded it), so it's worth catching repeats
+      the page-ratio threshold would miss. This also explains the original
+      furniture-detection question from two sessions ago without ever
+      getting the raw-page sample that was asked for: a hallucinated
+      phrase repeated only across the vision-processed subset of pages
+      (not the full 46) plausibly never crosses `FURNITURE_MIN_PAGE_RATIO`
+      either. 5 new tests (unit tests for `_normalize_heading_text`/
+      `_find_repeated_heading_texts`/`_is_heading`'s threshold behavior,
+      plus one `chunk_pages`-level end-to-end case reproducing the exact
+      "Zone Wiring real heading survives, Table of Contents repeated
+      3x doesn't" scenario) — 83/83 pipeline-wide. Not verified against
+      the real document; same **reprocess from 'chunk'** step covers both
+      this and the field-value fix above in one pass.
 - [ ] **Needs to happen on your machine:**
   1. `git pull`. `cd pipeline && pip install -e ".[dev]"`, `pytest` →
-     expect 78 passed. `cd review-ui && npm install` (no new deps), `npm
+     expect 83 passed. `cd review-ui && npm install` (no new deps), `npm
      run dev`.
   2. Open the queue view and confirm the new segmented progress bar
      renders sensibly for a document in each state (queued, mid-pipeline,
@@ -1310,12 +1346,15 @@ click approve. Repeat for every manual we use at work.
      look) for that first moment, then hands off to the progress bar.
   4. Reprocess the Enforcer V11 document **from 'chunk'** (chunks only —
      cleaned pages don't need to change) and reopen `/graph`: confirm
-     `**Page Number:** 4` (and any other bold-field artifacts) no longer
-     show up as node/neighbor labels, and that clicking a related chunk
-     now visibly makes sense relative to its label. If you spot a
-     *different* garbage label pattern surviving this fix, paste it —
-     that's the concrete data needed to extend `_FIELD_VALUE_LINE_RE`
-     rather than guessing at a broader pattern up front.
+     neither `**Page Number:** 4` nor `**Table of Contents**` show up as
+     node/neighbor labels anymore, and that clicking a related chunk now
+     visibly makes sense relative to its label. If a *different* garbage
+     label pattern survives this fix, paste it — that's the concrete data
+     needed to extend the guard rather than guessing at a broader pattern
+     up front. Also worth eyeballing whether the 3-distinct-pages
+     threshold is too aggressive on a real corpus (a legitimately-reused
+     heading losing its `section` label 3+ times in) — if so, it's a
+     one-constant change (`_MIN_REPEATED_HEADING_PAGES` in `chunk.py`).
 
 ## 11. Session log
 
@@ -1340,4 +1379,5 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Added reprocess/hard-reset controls to the review UI, on `main` (sandbox still has no real Supabase/NIM). Neither `corpus reprocess` nor `corpus reset` existed before this session; built `pipeline/corpus/reprocess.py` (`reprocess_document`/`reset_hard`, importable, reusing the "delete what the target stage's resumability guard checks, then call the normal stage function" pattern `restore-furniture` already established) with `cli.py`'s new `reprocess`/`reset` commands as thin wrappers, plus two new `db.py` functions (`delete_document`, `clear_chunk_embeddings`). 11 new tests against a call-order-recording `FakeDB` (76/76 pipeline-wide), plus a `CliRunner` smoke test of the new CLI wiring. review-ui: three new Route Handlers (`GET /api/documents` for 3s polling, `POST .../reprocess`, `POST .../reset`, all guarded against acting on an in-progress document) instead of server actions, per explicit spec; a new `ReprocessControls` split-button+overflow-menu component (warns about losing manual chunk retrieval toggles only for the two stages that actually delete+recreate chunk rows; hard-reset behind a detailed `confirm()`); `DocumentTable` now polls and merges live status/error without a full server re-render, replacing `AutoRefresh` on the queue page specifically (left untouched on the document detail page). `tsc`/`next build` clean across all six routes; `next dev` smoke-tested locally — bad input 400s before touching Supabase, missing-credentials 500s are the same clean error every other route already gives here. Not run against real data/browser. | Pull, install both sides, `pytest` (76 passed expected), `npm run dev`. Reprocess the CTec manual from the UI and watch status move through the stages live in the queue view (the task's own acceptance test); try each dropdown stage, confirm the manual-chunk-toggle warning appears/behaves correctly, hard-reset a disposable document and confirm the filesystem state is actually gone, and confirm both controls are genuinely disabled mid-run. |
 | 2026-07-18 | Tried the reprocess controls; worked, but two pieces of feedback: (1) furniture detection on a real 46-page manual (Enforcer V11 Programming Guide) only caught two repeated lines (the title header, the bare page number) — "that can't be it," expected more boilerplate to be flagged. Couldn't diagnose blind without seeing the actual raw pages (could be a threshold problem, a vision/OCR-variance matching problem, or genuinely correct for this document) — asked for a sample of what's being missed rather than guessing at a `clean.py` change; left open. (2) Wanted progress bars on running tasks generally, not just the queue's status word. Built on `main` (sandbox still has no real Supabase): new `StageProgress` component (segmented Queued/Extract/Clean&chunk/Embed/Review bar driven by `documents.status`, works for every path that moves a document through those statuses — processing, retry, reprocess — without knowing which one triggered it), replacing `StatusBadge` (deleted entirely, not left as dead code; its `ACTIVE_STATUSES` constant moved to `lib/types.ts`) in both the queue table and the document detail page. New `Spinner`/`PendingSubmitButton` components wired into every button that kicks off a background run (retry, approve, restore-furniture-line, proceed-anyway, delete, reprocess, hard reset) so a click gets immediate visual feedback instead of looking inert until the next poll. `tsc`/`next build` clean across all six routes, `next dev` smoke-tested (same expected credentials-missing 500s). | Pull, `npm install`, `npm run dev`. Check the new progress bar renders sensibly across every status and that each button shows its spinner immediately on click. Separately: reply with what furniture you'd expect flagged on the Enforcer V11 manual (or paste a couple of raw `work/<hash>/pages/*.md` files) so the detection question can actually get resolved instead of guessed at. |
 | 2026-07-18 | Root-caused the furniture-detection and confusing-graph-labels feedback from the same session down to one bug: `chunk.py`'s `_is_heading()` heuristic (short, single-line, no trailing punctuation) also matches vision-transcribed `**Label:** value` bold field lines, e.g. `**Page Number:** 4`. Once misclassified as a heading, that text becomes `chunk.section` — and thus `/graph`'s node/neighbor labels — for every chunk after it, so many unrelated chunks on many different real pages all showed the same misleading label, and clicking a "related chunk" correctly jumped to genuinely different content that just had a lying label (the edges/click behavior were never broken). Also explains why furniture detection missed it without needing the raw-page sample asked for last session: a field whose value is stuck at a constant "4" would still only appear on the subset of pages that went through the vision path, likely too few of the full 46 to cross `FURNITURE_MIN_PAGE_RATIO`. Fixed with a `_FIELD_VALUE_LINE_RE` guard in `_is_heading()`; 2 new tests (78/78 pipeline-wide) confirming the field line doesn't become `section` and doesn't clobber a real preceding heading. Not verified against the real document — the fix only helps once the affected document's chunks are regenerated. | Pull, install, `pytest` (78 passed expected). Reprocess the Enforcer V11 document **from 'chunk'** (via the reprocess controls built earlier this session) and reopen `/graph` — confirm `**Page Number:** 4`-style labels are gone and clicking a related chunk now makes sense relative to its label. Paste any other garbage label pattern that survives, rather than guessing at a broader fix up front. |
+| 2026-07-18 | Follow-up on the same real document: `/graph` also showing `**Table of Contents**` as the label for many unrelated real pages (not the actual TOC page), with high similarity scores between them. Same underlying bug class as the `**Page Number:** 4` fix earlier this session (`chunk.py`'s `_is_heading()` is too permissive), but a different literal phrase — the field-value regex didn't cover it since "Table of Contents" isn't a `Label: value` line. Generalized instead of special-casing another string: `chunk_pages` now runs a document-local pass (`_find_repeated_heading_texts`) that excludes any heading-shaped line repeating on 3+ distinct pages from ever being classified as a real heading, on the reasoning that a genuine section title is page-specific and essentially never repeats verbatim, while a much lower bar than clean.py's furniture threshold is worth it here since the failure mode of over-excluding is cheap (content is kept either way, only the `section` label falls back to the prior real heading). Also finally answers the original furniture-detection question from two sessions back without the raw-page sample that was asked for: a hallucinated phrase repeated only across the vision-processed subset of pages plausibly never reaches the furniture detector's ~30%-of-whole-document bar either. 5 new tests (83/83 pipeline-wide). Not verified against the real document — the same reprocess-from-'chunk' step covers both this and the earlier field-value fix. | Pull, install, `pytest` (83 passed expected). Reprocess the Enforcer V11 document from 'chunk' and reopen `/graph` — confirm both known garbage-label patterns are gone. If a third one shows up, paste it rather than have me guess at a broader rule. Also worth a gut check on whether 3 repeats is too aggressive once more real, larger manuals are loaded (a legitimately-reused heading text would lose its `section` label past that point) — it's a single constant to tune if so. |
 | 2026-07-19 | Added the cleaning stage per a fully-specified task (furniture stripping, structural page/chunk tagging, runt handling, >15% safety rail, Cleaning tab, furniture-detector unit tests) — one genuine gap in the spec: the repeated-safety-warning test case referenced "(see note below)" with no note attached. Asked and got a clear answer: add a keyword exception (`warning`/`caution`/`danger`/`note:`), never auto-strip that content regardless of repetition, given this is a fire/security panel corpus. Built `clean.py` (new), updated `chunk.py` (reads cleaned pages, runt handling, structural metadata), `cli.py` (`_process` gains a clean step + early-stop on the safety rail, new `restore-furniture` command), `db.py` (`delete_chunks`), a new migration (`documents.metadata` column, graph/search RPCs updated to respect the new exclusion rule), and the review UI's new Cleaning tab. Found and fixed two real logic bugs before they shipped (not caught by the spec, caught by testing): `apply_runt_handling` initially couldn't cascade-merge multiple consecutive runts (excluded already-runt-tagged chunks as merge targets, not just structural ones); `clean_pages` initially flattened cleaned lines with a single join, silently destroying the paragraph boundaries `chunk.py`'s splitting depends on. Also worked through several of my own test-fixture bugs (templated "page N" body text registering as furniture itself) before the real test suite was trustworthy. 65/65 pipeline tests passing (14 new for `clean.py`, 10 new for runt handling), 3 hand-built end-to-end scenarios verified via monkeypatched DB (safety rail correctly passes on realistic content, correctly trips and blocks chunk/embed on sparse content, `proceed_override` correctly unsticks it), `tsc`/`next build` clean across all four routes. Nothing verified against real Supabase/NIM/manuals — same sandbox constraint as every session. | Pull, reinstall (no new deps either side), apply the new migration, `pytest` (expect 65 passed). Run a real manual through and actually judge the heuristic against real content: does furniture.json look right, does a real TOC page get tagged, does a repeated real safety warning survive, is 15% the right safety-rail threshold. Try restoring a furniture line and toggling a structural/runt chunk's retrieval inclusion for real. Then back to loading the rest of the corpus (M6). |

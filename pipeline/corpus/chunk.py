@@ -31,6 +31,24 @@ _HEADING_MAX_CHARS = 80
 # the same misleading field text).
 _FIELD_VALUE_LINE_RE = re.compile(r"^\*\*[^*\n]+:\*\*")
 
+# A genuine section heading is specific to where it appears in the
+# document and essentially never repeats verbatim. Text that's shaped like
+# a heading but shows up identically on several different pages is a
+# vision artifact instead — e.g. a hallucinated "**Table of Contents**"
+# line transcribed onto pages that aren't the actual TOC, or a repeated
+# navigational element. Deliberately a much lower bar than clean.py's
+# furniture detector (which only strips at ~30%-of-document scale): the
+# cost of wrongly excluding a genuinely-reused short heading from
+# `section` here is low (the chunk keeps its full content either way, it
+# just falls back to whatever real heading preceded it), so it's worth
+# catching repeats clean.py's page-level furniture threshold would miss.
+_MIN_REPEATED_HEADING_PAGES = 3
+_HEADING_MARKUP_RE = re.compile(r"^[#*\s]+|[#*\s]+$")
+
+
+def _normalize_heading_text(text: str) -> str:
+    return _HEADING_MARKUP_RE.sub("", text).strip().lower()
+
 
 def estimate_tokens(text: str) -> int:
     """Rough chars/4 approximation. Good enough for chunk sizing; not tied
@@ -63,7 +81,7 @@ def _is_procedure(lines: list[str]) -> bool:
     return hits / len(lines) >= 0.6
 
 
-def _is_heading(para: str, lines: list[str]) -> bool:
+def _is_heading_shaped(para: str, lines: list[str]) -> bool:
     if len(lines) != 1:
         return False
     if len(para) > _HEADING_MAX_CHARS:
@@ -75,8 +93,40 @@ def _is_heading(para: str, lines: list[str]) -> bool:
     return True
 
 
+def _find_repeated_heading_texts(pages: list[dict]) -> set[str]:
+    """Normalized text of every heading-shaped line that appears on
+    _MIN_REPEATED_HEADING_PAGES or more distinct pages in this document —
+    see the constant's docstring above for why that disqualifies it from
+    being treated as a real section heading."""
+    pages_seen: dict[str, set[int]] = {}
+    for page in pages:
+        for para in re.split(r"\n\s*\n", page["text"].strip()):
+            para = para.strip()
+            if not para:
+                continue
+            lines = [line for line in para.splitlines() if line.strip()]
+            if not lines or not _is_heading_shaped(para, lines):
+                continue
+            normalized = _normalize_heading_text(para)
+            if normalized:
+                pages_seen.setdefault(normalized, set()).add(page["page"])
+    return {
+        text for text, seen in pages_seen.items() if len(seen) >= _MIN_REPEATED_HEADING_PAGES
+    }
+
+
+def _is_heading(para: str, lines: list[str], repeated_headings: set[str]) -> bool:
+    if not _is_heading_shaped(para, lines):
+        return False
+    return _normalize_heading_text(para) not in repeated_headings
+
+
 def _split_page_into_blocks(
-    page_num: int, text: str, extraction_path: str, structural: bool
+    page_num: int,
+    text: str,
+    extraction_path: str,
+    structural: bool,
+    repeated_headings: set[str],
 ) -> list[Block]:
     blocks = []
     for para in re.split(r"\n\s*\n", text.strip()):
@@ -90,7 +140,7 @@ def _split_page_into_blocks(
             kind = "table"
         elif _is_procedure(lines):
             kind = "procedure"
-        elif _is_heading(para, lines):
+        elif _is_heading(para, lines, repeated_headings):
             kind = "heading"
         else:
             kind = "text"
@@ -273,6 +323,7 @@ def chunk_pages(
     clean.py. Runt handling (merge/tag chunks under 50 tokens) is a
     separate pass — see apply_runt_handling — not applied here, so this
     function stays a pure "pack blocks into chunks" step."""
+    repeated_headings = _find_repeated_heading_texts(pages)
     all_blocks: list[Block] = []
     for page in pages:
         all_blocks.extend(
@@ -281,6 +332,7 @@ def chunk_pages(
                 page["text"],
                 page.get("extraction_path", "text"),
                 page.get("structural", False),
+                repeated_headings,
             )
         )
     all_blocks = _merge_adjacent_atomic(all_blocks)
