@@ -1,5 +1,6 @@
 """CLI entrypoints: check, ingest, watch, process, retry, status."""
 
+import json
 import time
 from pathlib import Path
 
@@ -86,10 +87,27 @@ def check():
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
-def ingest(path: Path):
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print {id, duplicate, file_name} as JSON instead of a human-readable line "
+    "(for scripted callers, e.g. review-ui's upload action).",
+)
+def ingest(path: Path, as_json: bool):
     """Ingest a single PDF: hash, copy to store/, insert a `documents` row."""
     row = intake.ingest(path)
-    if row.get("duplicate"):
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "id": row["id"],
+                    "duplicate": bool(row.get("duplicate")),
+                    "file_name": path.name,
+                }
+            )
+        )
+    elif row.get("duplicate"):
         click.echo(f"Duplicate (already ingested as {row['id']}): {path.name}")
     else:
         click.echo(f"Ingested {path.name} -> document {row['id']} (status=queued)")

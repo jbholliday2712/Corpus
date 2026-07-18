@@ -1,10 +1,11 @@
 import Link from "next/link";
 import { getSupabaseAdmin } from "@/lib/supabase";
 import type { DocumentRow } from "@/lib/types";
-import { deleteDocument, retryDocument } from "./actions";
+import { deleteDocument, retryDocument, uploadDocument } from "./actions";
 import { StatusBadge } from "@/components/StatusBadge";
 import { MetadataForm } from "@/components/MetadataForm";
 import { ConfirmSubmitButton } from "@/components/ConfirmSubmitButton";
+import { UploadForm } from "@/components/UploadForm";
 
 export const dynamic = "force-dynamic";
 
@@ -42,6 +43,8 @@ export default async function QueuePage({
     <main className="mx-auto max-w-6xl p-8">
       <h1 className="mb-6 text-2xl font-semibold">Corpus — Document Queue</h1>
 
+      <UploadForm action={uploadDocument} />
+
       {retrying && (
         <p className="mb-4 rounded bg-blue-50 px-3 py-2 text-sm text-blue-800">
           Retry started for document {retrying}. It runs in the background —
@@ -51,8 +54,8 @@ export default async function QueuePage({
 
       {docs.length === 0 ? (
         <p className="text-gray-500">
-          No documents yet. Drop a PDF in <code>inbox/</code> and run{" "}
-          <code>corpus watch</code>.
+          No documents yet. Upload a PDF above, or drop one in{" "}
+          <code>inbox/</code> and run <code>corpus watch</code>.
         </p>
       ) : (
         <div className="overflow-x-auto">

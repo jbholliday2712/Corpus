@@ -9,10 +9,13 @@ export const dynamic = "force-dynamic";
 
 export default async function DocumentPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ uploaded?: string; duplicate?: string }>;
 }) {
   const { id } = await params;
+  const { uploaded, duplicate } = await searchParams;
   const supabase = getSupabaseAdmin();
 
   const { data: doc, error: docError } = await supabase
@@ -43,6 +46,20 @@ export default async function DocumentPage({
       <Link href="/" className="text-sm text-blue-700 hover:underline">
         &larr; Back to queue
       </Link>
+
+      {uploaded && (
+        <p className="mt-4 rounded bg-blue-50 px-3 py-2 text-sm text-blue-800">
+          Uploaded. Processing (extract → metadata → chunk → embed) is
+          running in the background — reload this page in a bit to see
+          chunks appear.
+        </p>
+      )}
+      {duplicate && (
+        <p className="mt-4 rounded bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          This file was already ingested (matching content hash) — showing
+          the existing document instead of re-processing it.
+        </p>
+      )}
 
       <h1 className="mt-2 mb-1 text-2xl font-semibold">{typedDoc.file_name}</h1>
       <p className="mb-6 flex flex-wrap items-center gap-2 text-sm text-gray-600">
