@@ -9,9 +9,11 @@ import {
   setChunkRetrievalOverride,
   setProceedOverride,
 } from "@/app/actions";
-import { ACTIVE_STATUSES, StatusBadge } from "@/components/StatusBadge";
 import { AutoRefresh } from "@/components/AutoRefresh";
+import { PendingSubmitButton } from "@/components/PendingSubmitButton";
+import { StageProgress } from "@/components/StageProgress";
 import { computeDocumentFlags, isChunkFlagged } from "@/lib/flags";
+import { ACTIVE_STATUSES } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -131,7 +133,7 @@ export default async function DocumentPage({
       <h1 className="mt-3 mb-2 text-2xl font-semibold text-gray-900">
         {typedDoc.file_name}
       </h1>
-      <p className="mb-6 flex flex-wrap items-center gap-2 text-sm text-gray-600">
+      <p className="mb-3 flex flex-wrap items-center gap-2 text-sm text-gray-600">
         <span>{typedDoc.manufacturer ?? "?"}</span>
         <span>&middot;</span>
         <span>{typedDoc.panel_model ?? "?"}</span>
@@ -140,10 +142,12 @@ export default async function DocumentPage({
         <span>&middot;</span>
         <span>rev {typedDoc.revision ?? "?"}</span>
         <span>&middot;</span>
-        <StatusBadge status={typedDoc.status} />
-        <span>&middot;</span>
         <span>{typedChunks.length} chunks</span>
       </p>
+
+      <div className="mb-6 max-w-xs">
+        <StageProgress status={typedDoc.status} />
+      </div>
 
       {typedDoc.error_message && (
         <p className="mb-6 whitespace-pre-wrap rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
@@ -165,12 +169,11 @@ export default async function DocumentPage({
       {typedDoc.status === "review" && (
         <form action={approveDocument} className="mb-8">
           <input type="hidden" name="id" value={typedDoc.id} />
-          <button
-            type="submit"
-            className="rounded bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-700"
-          >
-            Approve &rarr; done
-          </button>
+          <PendingSubmitButton
+            label="Approve → done"
+            pendingLabel="Approving…"
+            className="rounded bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+          />
         </form>
       )}
       {typedDoc.status === "done" && (
@@ -270,12 +273,11 @@ export default async function DocumentPage({
               {!proceedOverride && (
                 <form action={setProceedOverride}>
                   <input type="hidden" name="id" value={typedDoc.id} />
-                  <button
-                    type="submit"
-                    className="rounded bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700"
-                  >
-                    Proceed anyway (chunk &amp; embed as cleaned)
-                  </button>
+                  <PendingSubmitButton
+                    label="Proceed anyway (chunk & embed as cleaned)"
+                    pendingLabel="Starting…"
+                    className="rounded bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  />
                 </form>
               )}
               {proceedOverride && (
@@ -333,12 +335,11 @@ export default async function DocumentPage({
                               name="normalizedLine"
                               value={entry.normalized}
                             />
-                            <button
-                              type="submit"
-                              className="rounded bg-gray-700 px-2 py-1 text-xs text-white hover:bg-gray-800"
-                            >
-                              Restore
-                            </button>
+                            <PendingSubmitButton
+                              label="Restore"
+                              pendingLabel="Restoring…"
+                              className="rounded bg-gray-700 px-2 py-1 text-xs text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+                            />
                           </form>
                         </td>
                       </tr>

@@ -5,10 +5,11 @@ import { useEffect, useMemo, useState } from "react";
 import type { DocStatus, DocumentRow } from "@/lib/types";
 import type { DocumentFlag } from "@/lib/flags";
 import { deleteDocument, retryDocument } from "@/app/actions";
-import { StatusBadge } from "@/components/StatusBadge";
 import { MetadataForm } from "@/components/MetadataForm";
 import { ConfirmSubmitButton } from "@/components/ConfirmSubmitButton";
+import { PendingSubmitButton } from "@/components/PendingSubmitButton";
 import { ReprocessControls } from "@/components/ReprocessControls";
+import { StageProgress } from "@/components/StageProgress";
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -151,7 +152,7 @@ export function DocumentTable({
                     <MetadataForm doc={doc} />
                   </td>
                   <td className="px-4 py-3">
-                    <StatusBadge status={status} />
+                    <StageProgress status={status} />
                     {doc.metadata_confirmed && (
                       <div className="mt-1 text-xs text-green-700">metadata confirmed</div>
                     )}
@@ -168,12 +169,11 @@ export function DocumentTable({
                       {status === "failed" && (
                         <form action={retryDocument}>
                           <input type="hidden" name="id" value={doc.id} />
-                          <button
-                            type="submit"
-                            className="rounded bg-amber-600 px-2 py-1 text-xs text-white hover:bg-amber-700"
-                          >
-                            Retry
-                          </button>
+                          <PendingSubmitButton
+                            label="Retry"
+                            pendingLabel="Starting…"
+                            className="rounded bg-amber-600 px-2 py-1 text-xs text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          />
                         </form>
                       )}
                       <ReprocessControls
@@ -186,8 +186,9 @@ export function DocumentTable({
                         <input type="hidden" name="id" value={doc.id} />
                         <ConfirmSubmitButton
                           label="Delete"
+                          pendingLabel="Deleting…"
                           confirmText={`Delete ${doc.file_name}? This also deletes its chunks.`}
-                          className="rounded bg-red-600 px-2 py-1 text-xs text-white hover:bg-red-700"
+                          className="rounded bg-red-600 px-2 py-1 text-xs text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
                         />
                       </form>
                     </div>

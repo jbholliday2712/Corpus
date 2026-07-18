@@ -1,6 +1,7 @@
 "use client";
 
 import { useFormStatus } from "react-dom";
+import { Spinner } from "@/components/Spinner";
 
 function SubmitButton() {
   const { pending } = useFormStatus();
@@ -8,9 +9,12 @@ function SubmitButton() {
     <button
       type="submit"
       disabled={pending}
-      className="rounded bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
+      className="rounded bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
     >
-      {pending ? "Uploading…" : "Upload PDF"}
+      <span className="inline-flex items-center gap-1.5">
+        {pending && <Spinner />}
+        {pending ? "Uploading…" : "Upload PDF"}
+      </span>
     </button>
   );
 }

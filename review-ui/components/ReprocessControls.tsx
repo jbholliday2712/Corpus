@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { DocStatus } from "@/lib/types";
 import { IN_PROGRESS_STATUSES } from "@/lib/types";
+import { Spinner } from "@/components/Spinner";
 
 type Stage = "clean" | "chunk" | "embed";
 
@@ -33,7 +34,12 @@ export function ReprocessControls({
 }) {
   const router = useRouter();
   const [open, setOpen] = useState<"reprocess" | "overflow" | null>(null);
-  const [busy, setBusy] = useState(false);
+  // Which request is currently in flight, if any — drives both the
+  // disabled state and which button shows a spinner. This only covers the
+  // brief window of kicking off the detached background process, not the
+  // process finishing; StageProgress (fed by DocumentTable's poll) is what
+  // shows progress once it's actually running.
+  const [pendingAction, setPendingAction] = useState<"reprocess" | "reset" | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -46,11 +52,11 @@ export function ReprocessControls({
     return () => document.removeEventListener("mousedown", onClickOutside);
   }, []);
 
-  const disabled = busy || IN_PROGRESS_STATUSES.includes(status);
+  const disabled = pendingAction !== null || IN_PROGRESS_STATUSES.includes(status);
 
   async function runReprocess(fromStage: Stage) {
     setOpen(null);
-    setBusy(true);
+    setPendingAction("reprocess");
     try {
       const res = await fetch(`/api/documents/${documentId}/reprocess`, {
         method: "POST",
@@ -66,7 +72,7 @@ export function ReprocessControls({
     } catch (err) {
       alert(err instanceof Error ? err.message : "Reprocess request failed.");
     } finally {
-      setBusy(false);
+      setPendingAction(null);
     }
   }
 
@@ -83,7 +89,7 @@ export function ReprocessControls({
     );
     if (!confirmed) return;
 
-    setBusy(true);
+    setPendingAction("reset");
     try {
       const res = await fetch(`/api/documents/${documentId}/reset`, { method: "POST" });
       if (!res.ok) {
@@ -95,7 +101,7 @@ export function ReprocessControls({
     } catch (err) {
       alert(err instanceof Error ? err.message : "Reset request failed.");
     } finally {
-      setBusy(false);
+      setPendingAction(null);
     }
   }
 
@@ -108,7 +114,10 @@ export function ReprocessControls({
           onClick={() => runReprocess("clean")}
           className="rounded-l bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          Reprocess
+          <span className="inline-flex items-center gap-1.5">
+            {pendingAction === "reprocess" && <Spinner />}
+            {pendingAction === "reprocess" ? "Starting…" : "Reprocess"}
+          </span>
         </button>
         <button
           type="button"
@@ -148,7 +157,7 @@ export function ReprocessControls({
           className="rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
           aria-label="More actions"
         >
-          &#8942;
+          {pendingAction === "reset" ? <Spinner /> : <>&#8942;</>}
         </button>
         {open === "overflow" && (
           <div className="absolute right-0 top-full z-10 mt-1 w-36 rounded border border-gray-200 bg-white py-1 shadow-lg">
