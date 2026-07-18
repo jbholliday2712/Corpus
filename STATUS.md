@@ -637,8 +637,89 @@ click approve. Repeat for every manual we use at work.
       enum). Not urgent to block on — `metadata_confirmed=false` means
       review UI already catches it — but worth deciding before M5 if the
       review UI is expected to show these fields as clean, editable text.
-  5. Once that looks right, M4 is done. M5 (review UI) is next — no NIM
-     model needed for that, just Next.js talking to the same Supabase.
+  5. Once that looks right, M4 is done.
+- [x] **M4 is done.**
+- [x] M5 built: `review-ui/` — minimal Next.js 16 App Router app, TypeScript,
+      Tailwind v4, no auth (local-only trusted tool per STATUS.md §1). Two
+      pages per §5:
+  - **Queue view** (`app/page.tsx`, `/`): table of all documents — file
+    name/page count, an inline-editable metadata form (manufacturer/panel
+    model/doc_type-as-dropdown/revision, "Confirm"/"Update" button —
+    deliberately plain editable text inputs, not read-only display, because
+    of the M4 finding that the LLM sometimes writes explanatory prose into
+    `manufacturer`/`revision` instead of a clean value; this is where a
+    human fixes that before confirming), status badge, chunk count, error
+    message, and Retry (only shown when `status=failed`) / Delete buttons
+    (Delete has a JS confirm() dialog — the one Client Component in the app,
+    everything else is server-rendered).
+  - **Document view** (`app/documents/[id]/page.tsx`): chunks in
+    `chunk_index` order, each showing page range, section, extraction path
+    (vision-derived chunks visually flagged), token count, and the full
+    markdown content preformatted — the actual "did tables/procedures
+    survive intact, does this read like the real manual" inspection hatch.
+    "Approve → done" button when `status=review`.
+  - **Confirm/Delete/Approve** are direct Supabase mutations via Server
+    Actions (`app/actions.ts`) using the service role key server-side only
+    (`lib/supabase.ts`), never exposed to the browser. Delete relies on the
+    existing `ON DELETE CASCADE` on `chunks.document_id` from the M1 schema.
+  - **Retry** is different: the actual retry logic lives in the Python CLI
+    (`corpus retry`, built in M4, resumable per stage), and this Next.js app
+    has no reason to reimplement it — so the Retry button's server action
+    shells out to `python -m corpus.cli retry <id>` as a detached background
+    process (`CORPUS_PYTHON` / `CORPUS_PIPELINE_DIR` env vars point at the
+    pipeline's venv python and directory) and redirects back to the queue
+    with a "running in the background, reload in a bit" banner — a retry
+    can take minutes on a vision-heavy document, so nothing awaits it
+    in-request.
+  - `review-ui/.env.local.example` documents all four required env vars.
+  - **Real build issue found and fixed:** `npm install`'s resolved "latest"
+    `typescript` was `7.0.2` — as of this session's date that's evidently a
+    new major line (likely the native/Go compiler rewrite), and it crashed
+    Next's internal type-checking step with an opaque
+    `The "id" argument must be of type string. Received undefined` error
+    with no useful stack trace. Root-caused by diagnostically disabling the
+    TypeScript build step (`ignoreBuildErrors`) to confirm the crash was in
+    that step, not route generation, then pinning `typescript` to `^5.9.3`
+    (the line Next 16.2.10 actually expects) — fixed cleanly, no
+    workaround/ignoreBuildErrors left in the shipped `next.config.ts`.
+  - Also noted: `next build --webpack` fails to resolve the `@/*` path
+    alias entirely (`Module not found`) even with `baseUrl` set in
+    `tsconfig.json`, while the default Turbopack build resolves it fine.
+    Not investigated further since Turbopack is Next 16's default and the
+    actual build/dev path this app uses — flagging in case a future
+    Next.js upgrade needs the webpack fallback for some reason.
+  - **Verified in this sandbox** (no real Supabase here, same constraint as
+    every build session): `npm install`, `npx tsc --noEmit` clean, `next
+    build` succeeds (both `/` and `/documents/[id]` correctly marked
+    dynamic/server-rendered, not statically prerendered — they need fresh
+    DB data every load), and `next dev` actually boots and serves both
+    routes — confirmed each returns a clean HTTP 500 with the exact
+    `SUPABASE_URL / SUPABASE_SERVICE_KEY are not set` error message (from
+    `lib/supabase.ts`) rather than crashing, i.e. the app fails predictably
+    without credentials instead of breaking in some opaque way.
+- [ ] **Needs to happen on your machine:**
+  1. `git pull`. `cd review-ui && npm install`.
+  2. `cp .env.local.example .env.local`, fill in `SUPABASE_URL` /
+     `SUPABASE_SERVICE_KEY` (same values as `pipeline/.env`), and
+     `CORPUS_PYTHON` (path to the pipeline venv's python executable) /
+     `CORPUS_PIPELINE_DIR` (path to `pipeline/`) for the Retry button.
+  3. `npm run dev`, open `http://localhost:3000` — should show the real
+     document queue (whatever's currently in Supabase from earlier M2-M4
+     testing, if anything's left after cleanup).
+  4. Exercise the golden path in an actual browser: open a document, check
+     chunks render correctly (tables/procedures readable, vision-flagged
+     chunks visible), confirm/edit metadata on the queue view (including
+     cleaning up one of the "explanatory prose" manufacturer/revision
+     values from the M4 findings, if one's still sitting there), approve a
+     `review`-status document to `done`, and — if there's a genuinely
+     `failed` document sitting around — click Retry and confirm it resumes
+     in the background and the queue reflects the new status after a
+     reload. Delete something disposable (a test document) to check the
+     cascade actually removes its chunks too.
+  5. Once that's confirmed working against real data in a real browser, M5
+     is done. M6 is loading the real corpus (the 5 panels actually used at
+     work) — no more code changes needed for that, just running the
+     pipeline for real and reviewing every document.
 
 ## 11. Session log
 
@@ -656,3 +737,4 @@ click approve. Repeat for every manual we use at work.
 | 2026-07-18 | Tested M3 against a real manual (Pyronix Enforcer V11 install guide, 16 pages) for the first time. Legitimate vision pages (real tables/diagrams) transcribed accurately. Confirmed the hallucination risk for real: the back cover (solid color blocks + logo, zero real content) made the vision model fabricate an entire fake manual with invented specs/warranty/phone number. First fix attempt (prompt sentinel asking the model to say "NO_CONTENT") failed outright — the model ignored it and hallucinated something different instead. Real fix: `_is_flat_graphic(page)` in `extract.py`, a row-coverage pixel-variance heuristic that keeps flat-design pages off the vision path entirely rather than trusting the model to decline. Validated directly against the real page repeatedly during development (a naive cell-fraction version wrongly still let the real cover through; row-coverage fixed it). 6 new tests (33/33 total). Re-ran the real document end to end: chunk count correctly dropped 9→8, no fabricated chunk. Accidentally deleted the real ingested document during test cleanup (autopilot from the synthetic-test pattern); caught it, asked, left deleted per instruction — source PDF untouched in Downloads. | M3 is done (mechanics + the one real quality issue found). Start M4 (metadata inference + failure handling), needs `NIM_LLM_MODEL` set. Residual: `_is_flat_graphic` only catches flat-color-block pages, not other hallucination shapes — revisit if a different manual surfaces one. |
 | 2026-07-18 | M4 built on `main` (sandbox again has no `.env`). Added `metadata.py` (LLM metadata inference, resumable, wired into `_process` as best-effort/non-fatal). Implemented `corpus retry` for real — found and fixed a resumability gap along the way: `chunk_document` was re-inserting a duplicate chunk set on every call, which would have defeated `embed_document`'s resumability (and wasted NIM quota) on a retry-after-embed-failure; fixed with a `db.count_chunks` existence check, mirroring how extract/embed already skip completed work. 8 new tests (41/41 total); also manually verified (monkeypatched DB/NIM) that both `infer_metadata` and `chunk_document` correctly skip redoing work on a second call. | Pull, install, `pytest` (41 passed expected), set `NIM_LLM_MODEL`, then run metadata inference against a real manual and check the `documents` row. Test `corpus retry` against a real induced failure to confirm it resumes cleanly without wasting NIM calls. Then M5 (review UI). |
 | 2026-07-18 | Pulled M4, `pytest` 41/41, set `NIM_LLM_MODEL=meta/llama-3.3-70b-instruct` (was blank). Metadata inference on the real Enforcer V11 manual: panel_model/doc_type/revision came back clean, but `manufacturer` came back with the model's reasoning baked into the value instead of a clean string (e.g. `"Pyronix (implied, not explicitly stated but...)"`)  — reproduced the same pattern on a second document, confirming it's systemic, not a fluke. `corpus retry` tested against a genuine forced failure (bogus embed model), not just idempotency: confirmed failed→retry→review with the error cleared, no duplicate chunks, no wasted NIM calls on stages that already succeeded — also confirmed 0 wasted work retrying an already-successful document. Cleaned up both test documents afterward (source PDFs untouched). | Decide how to stop the LLM from writing prose into manufacturer/revision fields (tighten prompt further vs. add post-processing validation) before M5's review UI needs to show these as clean editable fields. Otherwise M4 is done — start M5 (review UI). |
+| 2026-07-18 | M5 built on `main` (sandbox again has no real Supabase): `review-ui/`, a minimal Next.js 16 App Router + TypeScript + Tailwind v4 app with the queue view and document view from STATUS.md §5. Queue view's metadata fields are plain editable inputs (not read-only) specifically because of the prose-in-manufacturer/revision finding from the last session — review here means "look and fix," which is the mitigation for that still-open decision. Retry button shells out to `python -m corpus.cli retry <id>` as a detached background process rather than reimplementing retry logic in JS. Hit and root-caused a real build break: `npm install` resolved `typescript` to `7.0.2`, which crashed Next's internal type-check with an opaque low-level Node error; pinned to `^5.9.3` (what Next 16.2.10 actually expects) after confirming via `ignoreBuildErrors` that the crash was specifically in the TS step. `next build` (Turbopack, the default) succeeds cleanly; noted but didn't chase a separate `--webpack` path-alias resolution failure since Turbopack is what this app actually uses. `next dev` boots and both routes correctly fail with a clean "SUPABASE_URL / SUPABASE_SERVICE_KEY are not set" 500 rather than crashing, since no real Supabase is reachable from here. | Pull, `npm install`, set up `review-ui/.env.local` from the example (same Supabase creds as `pipeline/.env`, plus CORPUS_PYTHON/CORPUS_PIPELINE_DIR for Retry), `npm run dev`, and actually use it in a browser against real data: open a document, check chunk rendering, edit/confirm metadata, approve a review-status doc, retry a failed one if any exist, delete a disposable test doc and confirm its chunks vanish too. Then M5 is done — M6 is loading the real 5-panel corpus, no more code needed for that. |

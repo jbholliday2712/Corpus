@@ -1,6 +1,7 @@
 # Environment
 .env
 pipeline/.env
+review-ui/.env.local
 
 # Python
 __pycache__/
@@ -16,6 +17,7 @@ build/
 node_modules/
 review-ui/.next/
 review-ui/out/
+review-ui/tsconfig.tsbuildinfo
 
 # Local ingestion data (gitignored per STATUS.md)
 inbox/*
